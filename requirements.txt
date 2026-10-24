@@ -1,0 +1,73 @@
+# # Core LangGraph & LLM
+# langgraph>=0.2.0
+# langchain>=0.3.0
+# langchain-core>=0.3.0
+# langchain-groq>=0.2.0
+
+# # Financial Data
+# yfinance>=0.2.40
+# sec-edgar-downloader>=5.0.0
+# alpha-vantage>=2.3.1
+
+# # Web Search
+# tavily-python>=0.3.0
+
+# # HTTP & Utils
+# requests>=2.31.0
+# python-dotenv>=1.0.0
+
+# # RAG (Phase 1 - in-memory, no vector DB)
+# tiktoken>=0.7.0
+
+# # Report Generation
+# python-docx>=1.1.0
+# reportlab>=4.2.0
+
+# # Math / Calculation
+# numpy>=1.26.0
+
+# ── Core LangGraph & LLM ─────────────────────────────────────────────────────
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-groq>=0.2.0
+
+# ── LangSmith tracing ────────────────────────────────────────────────────────
+langsmith>=0.1.0
+
+# ── Financial Data ───────────────────────────────────────────────────────────
+yfinance>=0.2.40
+
+# SEC EDGAR - clean section extraction + XBRL parsing (free, no API key)
+# Extracts Item 1, 1A, 7, 7A as clean text from 10-K/10-Q/8-K
+# Also reads structured XBRL financial data from data.sec.gov
+edgartools>=2.6.0
+
+# ── Web Search ───────────────────────────────────────────────────────────────
+tavily-python>=0.3.0
+
+# ── HTTP & Utils ─────────────────────────────────────────────────────────────
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# ── Report Generation ────────────────────────────────────────────────────────
+python-docx>=1.1.0
+
+# ── Math ─────────────────────────────────────────────────────────────────────
+numpy>=1.26.0
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+matplotlib
+
+# ── API layer (chat mode) ────────────────────────────────────────────────────
+# FastAPI serves both the streaming chat endpoint and the background report
+# jobs. No sse-starlette dependency: the SSE frames are formatted by hand in
+# api/server.py, which is ~5 lines and removes a dependency that would need
+# pinning against every Starlette release.
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.6.0
+langgraph-checkpoint-sqlite>=1.0.0   # chat thread persistence (see graph/chat_graph.py)
+tiktoken>=0.7.0                      # token-budget history windowing (see nodes/chat_agent.py)
+psycopg2-binary>=2.9.9              # only needed if DATABASE_URL points at Postgres

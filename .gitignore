@@ -1,0 +1,51 @@
+# ── Secrets — NEVER commit these ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example          # .env.example IS committed — it is the template
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Runtime-generated data ────────────────────────────────────────────────────
+# The SQLite database and generated reports are runtime artifacts.
+# They should not be in version control — use Docker volumes or a backup
+# strategy for persistence.
+output/*.db
+output/*.docx
+output/*.md
+output/*.pdf
+sec_data/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── LangSmith local cache ─────────────────────────────────────────────────────
+.langsmith/

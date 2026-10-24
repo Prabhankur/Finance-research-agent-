@@ -1,0 +1,48 @@
+# ── Secrets — NEVER bake these into the image ────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
+
+# ── Runtime-generated files ───────────────────────────────────────────────────
+# The output/ directory contains the SQLite DB and generated reports.
+# These are mounted as a Docker volume at runtime so they persist across
+# container restarts — baking them into the image would be wrong.
+output/*.db
+output/*.docx
+output/*.md
+output/*.pdf
+sec_data/
+
+# ── Development / test artifacts ──────────────────────────────────────────────
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── IDE and OS files ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# ── Git ────────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Documentation (not needed at runtime) ─────────────────────────────────────
+*.md
+docs/
+CHAT_MODE.md
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
