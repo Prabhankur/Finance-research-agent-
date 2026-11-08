@@ -203,6 +203,9 @@ Return only the JSON object described above.
 #  Scoring
 # ─────────────────────────────────────────────────────────────────────────────
 
+from utils.text_budget import fair_share
+
+
 def _summarise_tool_results(successful_results: list[dict], max_chars: int = 2000) -> str:
     """Compresses tool payloads so the judge prompt stays within a sane
     token budget — the judge doesn't need the full 10-K text, only the
@@ -210,18 +213,15 @@ def _summarise_tool_results(successful_results: list[dict], max_chars: int = 200
     if not successful_results:
         return "(no tool results — the assistant answered from prior context or general knowledge)"
 
-    parts: list[str] = []
-    remaining = max_chars
-    for record in successful_results:
-        header = f"[{record.get('tool', '?')}] args={json.dumps(record.get('args') or {})}"
-        body = str(record.get("result") or "")[: max(200, remaining // len(successful_results))]
-        block = f"{header}\n{body}"
-        parts.append(block)
-        remaining -= len(block)
-        if remaining <= 0:
-            break
-
-    return "\n\n".join(parts)
+    # Fair share per result. This used to divide the REMAINING budget by the
+    # TOTAL count on every pass, so in a multi-company answer the last company's
+    # data was cut hardest — and the judge, seeing a truncated slice, could mark
+    # a correct figure "ungrounded".
+    blocks = [
+        f"[{r.get('tool', '?')}] args={json.dumps(r.get('args') or {})}\n{str(r.get('result') or '')}"
+        for r in successful_results
+    ]
+    return "\n\n".join(fair_share(blocks, max_chars))
 
 
 def _summarise_contradictions(contradictions: list[dict]) -> str:
@@ -358,6 +358,7 @@ def score_turn(
     successful_tool_results: list[dict],
     contradictions: list[dict],
     turn_status: str,
+    synthesis_mode: str = "normal",
 ) -> Optional[dict]:
     """
     Runs the judge on one turn and persists the result.
@@ -427,6 +428,9 @@ def score_turn(
         "tool_count":            len(successful_tool_results),
         "contradiction_count":   len(contradictions),
         "turn_status":           turn_status,
+        # "rescue" = answered by the fresh-prompt fallback with narrower
+        # context; lets the rollup compare rescued vs normal quality.
+        "synthesis_mode":        synthesis_mode,
         "fidelity_mismatches":   fidelity["mismatches"] if fidelity else [],
     }
 

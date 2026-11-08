@@ -60,6 +60,76 @@ def _av_fetch(function: str, ticker: str, extra_params: Optional[dict] = None) -
 
 # ── Main tool function ────────────────────────────────────────────────────────
 
+_CURRENCY_CACHE: dict[str, tuple[Optional[str], Optional[str]]] = {}
+
+
+def _currencies(ticker: str, stock=None, info: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
+    """
+    (trading_currency, reporting_currency) for a ticker, best effort.
+
+    These are two DIFFERENT facts and yfinance exposes them separately:
+    `currency` is what the share trades in, `financialCurrency` is what the
+    statements are reported in. They agree for most listings but not all — an
+    ADR such as Infosys trades in USD on a US exchange while reporting in INR.
+    Statement numbers are in the reporting currency, so that is the one a
+    statement header must carry.
+
+    Cached per ticker for the life of the process (a company does not change
+    its reporting currency), and failures are NOT cached so a transient error
+    does not hide the currency until restart.
+    """
+    key = ticker.upper()
+    if info is not None:
+        pair = (info.get("currency"), info.get("financialCurrency") or info.get("currency"))
+        if pair[1]:
+            _CURRENCY_CACHE[key] = pair
+        return pair
+    if key in _CURRENCY_CACHE:
+        return _CURRENCY_CACHE[key]
+    try:
+        i = (stock or yf.Ticker(ticker)).info or {}
+        pair = (i.get("currency"), i.get("financialCurrency") or i.get("currency"))
+    except Exception:
+        return (None, None)
+    if pair[1]:
+        _CURRENCY_CACHE[key] = pair
+    return pair
+
+
+def _ccy_tag(ticker: str, stock=None) -> str:
+    """' [reporting currency: INR]' for a statement header, or '' if unknown."""
+    reporting = _currencies(ticker, stock)[1]
+    return f" [reporting currency: {reporting}]" if reporting else ""
+
+
+def _av_ccy_tag(reports: list) -> str:
+    """Alpha Vantage states each statement's currency as `reportedCurrency`."""
+    ccy = reports[0].get("reportedCurrency") if reports else None
+    return f" [reporting currency: {ccy}]" if ccy else ""
+
+
+def _dividend_yield_pct(info: dict) -> float:
+    """
+    Dividend yield as a PERCENT, derived from dividendRate / price.
+
+    Why not info["dividendYield"] * 100 (what this used to do): yfinance
+    changed that field's UNITS between versions — older releases return a
+    fraction (0.0044), newer ones already return a percent (0.44). Multiplying
+    by 100 is right for one and wrong by 100x for the other; the agent
+    reported Apple's yield as "31%". Annual dividend per share and the share
+    price are plain currency amounts whose meaning has not changed, so the
+    ratio is correct under either version.
+    """
+    rate = info.get("dividendRate")
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    try:
+        if rate and price:
+            return round(float(rate) / float(price) * 100, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 0.0
+
+
 def financial_data_api(
     ticker: str,
     statement_type: str = "overview",
@@ -94,18 +164,22 @@ def financial_data_api(
             info  = stock.info
 
             if info and "marketCap" in info:
+                _currencies(ticker, info=info)
                 overview = {
                     "Company Name":         info.get("longName"),
                     "Sector":               info.get("sector"),
                     "Industry":             info.get("industry"),
                     "Current Price":        info.get("currentPrice") or info.get("regularMarketPrice"),
                     "Currency":             info.get("currency"),
+                    "Reporting Currency":   info.get("financialCurrency") or info.get("currency"),
+                    "Exchange":             info.get("exchange"),
+                    "Country":              info.get("country"),
                     "Market Cap":           info.get("marketCap"),
                     "Trailing P/E":         info.get("trailingPE"),
                     "Forward P/E":          info.get("forwardPE"),
                     "EV/EBITDA":            info.get("enterpriseToEbitda"),
                     "Price/Book":           info.get("priceToBook"),
-                    "Dividend Yield (%)":   round((info.get("dividendYield") or 0) * 100, 2),
+                    "Dividend Yield (%)":   _dividend_yield_pct(info),
                     "52-Week High":         info.get("fiftyTwoWeekHigh"),
                     "52-Week Low":          info.get("fiftyTwoWeekLow"),
                     "50-Day MA":            info.get("fiftyDayAverage"),
@@ -133,7 +207,7 @@ def financial_data_api(
         try:
             stock = yf.Ticker(ticker)
             fin = stock.financials if period == "annual" else stock.quarterly_financials
-            block = [f"[FinData] Income Statement ({period.title()}) – {ticker}"]
+            block = [f"[FinData] Income Statement ({period.title()}) – {ticker}{_ccy_tag(ticker, stock)}"]
 
             if fin is not None and not fin.empty:
                 # yfinance returns a DataFrame with rows=metrics, columns=periods
@@ -168,7 +242,7 @@ def financial_data_api(
                 data    = _av_fetch(av_func, ticker)
                 key     = "annualReports" if period == "annual" else "quarterlyReports"
                 reports = data.get(key, [])[:years]
-                block   = [f"[FinData] Income Statement ({period.title()}) – {ticker}"]
+                block   = [f"[FinData] Income Statement ({period.title()}) – {ticker}{_av_ccy_tag(reports)}"]
                 if not reports:
                     block.append(f"\n  [Data unavailable] Neither yfinance ({yf_exc}) nor Alpha Vantage returned {period} income statement data for {ticker}.")
                 for r in reports:
@@ -191,7 +265,7 @@ def financial_data_api(
         try:
             stock = yf.Ticker(ticker)
             bs = stock.balance_sheet if period == "annual" else stock.quarterly_balance_sheet
-            block = [f"[FinData] Balance Sheet ({period.title()}) – {ticker}"]
+            block = [f"[FinData] Balance Sheet ({period.title()}) – {ticker}{_ccy_tag(ticker, stock)}"]
 
             if bs is not None and not bs.empty:
                 cols = bs.columns[:years]
@@ -221,7 +295,7 @@ def financial_data_api(
                 data    = _av_fetch("BALANCE_SHEET", ticker)
                 key     = "annualReports" if period == "annual" else "quarterlyReports"
                 reports = data.get(key, [])[:years]
-                block   = [f"[FinData] Balance Sheet ({period.title()}) – {ticker}"]
+                block   = [f"[FinData] Balance Sheet ({period.title()}) – {ticker}{_av_ccy_tag(reports)}"]
                 if not reports:
                     block.append(f"\n  [Data unavailable] Neither yfinance ({yf_exc}) nor Alpha Vantage returned {period} balance sheet data.")
                 for r in reports:
@@ -243,7 +317,7 @@ def financial_data_api(
         try:
             stock = yf.Ticker(ticker)
             cf = stock.cashflow if period == "annual" else stock.quarterly_cashflow
-            block = [f"[FinData] Cash Flow ({period.title()}) – {ticker}"]
+            block = [f"[FinData] Cash Flow ({period.title()}) – {ticker}{_ccy_tag(ticker, stock)}"]
 
             if cf is not None and not cf.empty:
                 cols = cf.columns[:years]
@@ -270,7 +344,7 @@ def financial_data_api(
                 data    = _av_fetch("CASH_FLOW", ticker)
                 key     = "annualReports" if period == "annual" else "quarterlyReports"
                 reports = data.get(key, [])[:years]
-                block   = [f"[FinData] Cash Flow ({period.title()}) – {ticker}"]
+                block   = [f"[FinData] Cash Flow ({period.title()}) – {ticker}{_av_ccy_tag(reports)}"]
                 if not reports:
                     block.append(f"\n  [Data unavailable] Neither yfinance ({yf_exc}) nor Alpha Vantage returned {period} cash flow data.")
                 for r in reports:

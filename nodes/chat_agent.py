@@ -43,8 +43,10 @@ Three failure modes this node is specifically built to survive:
 
 from __future__ import annotations
 
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from datetime import date
 from typing import Any
 
@@ -66,9 +68,11 @@ from config import (
     CHAT_TOOL_RESULT_MAX_CHARS,
 )
 from graph.chat_state import ChatState
+from config import CHAT_MAX_BATCH_TICKERS, INTENT_OUT_OF_SCOPE, LOCAL_RETRY_LIMIT, TRANSIENT_RETRY_PAUSE_S
+from utils.text_budget import fair_share
 from tools import TOOLS_BY_NAME as _SHARED_TOOLS_BY_NAME
 from tools.chart_tool import CHART_TOOL_NAME, render_chart
-from utils.error_classifier import LEGITIMATE_EMPTY, OK, classify_result
+from utils.error_classifier import LEGITIMATE_EMPTY, OK, SYSTEMIC, TRANSIENT, BAD_ARGS, classify_result
 from utils.groq_client import get_llm, invoke_with_retry
 from utils.contradiction_detector import (
     find_contradictions_from_state,
@@ -101,6 +105,9 @@ def _system_prompt(
     tools_available: bool,
     conversation_summary: str | None = None,
     contradiction_note: str | None = None,
+    *,
+    active_tickers: list[str] | None = None,
+    brief: dict | None = None,
 ) -> str:
     today = date.today().isoformat()
 
@@ -115,7 +122,18 @@ data using real data tools — never from memory.
   debt, growth rate) unless it came from a tool result THIS conversation or
   the summary below. If you don't have it, say so and offer to fetch. Never
   invent plausible-looking numbers.
-- Use `calculator` for arithmetic — do not do multi-digit math in your head.
+- Use `calculator` for ALL arithmetic, never mental math. Plain arithmetic:
+  metric sum/subtract/multiply/divide/average with a `values` list (four
+  quarters: values=[q1,q2,q3,q4]); `percent_change` for a simple change;
+  `cagr` ONLY for multi-year compound growth — never to add.
+- CURRENCY: figures are in each company's own currency (see the data header,
+  e.g. [reporting currency: INR]). Never add, compare or rank across different
+  currencies — say they differ. Convert ONLY when the user explicitly asks:
+  fx_rate, then calculator multiply. Non-US tickers need a suffix (.NS .BO .L .TO).
+- NEVER sum per-capita values, rates, percentages, ratios or index values
+  across periods — they are not additive. Quarterly LEVEL series (e.g.
+  NA000334Q, millions) may be summed to a year; if an annual series exists
+  (e.g. GDPA), fetch it instead.
 
 ## Source citation with evidence tiers
 
@@ -132,9 +150,9 @@ silently averaging. Convert raw units — $391,035,000,000 → $391.0B.
 
 ## Tool usage
 
-- PARALLEL calls when independent. For multi-company comparisons, request
-  all companies in ONE batch — splitting across rounds re-sends context
-  and wastes token budget.
+- For 2+ companies make ONE financial_data_api call with `tickers=[...]` (max 8),
+  never one call per company — each extra round re-sends the whole prompt.
+  Other independent calls (different tools) go in the same message.
 - Don't re-fetch data already in context or the summary.
 - Use `fields` on `financial_data_api` when you only need specific metrics —
   a comparison across 3 companies with fields=["revenue","operating_margin"]
@@ -142,7 +160,10 @@ silently averaging. Convert raw units — $391,035,000,000 → $391.0B.
   you know exactly what you need.
 - `earnings_transcript` is rate-limited (25/day) — use only when the user
   asks about what management said on a call.
-- On tool error, say what failed and answer with what you have. Don't guess.
+- Tool errors: a tool reported "unavailable" must not be called again — use
+  another source or answer with what you have. Fix bad arguments once; never
+  repeat an identical failing call. "No data exists" is a valid answer: say it
+  is not available. Say what failed. Never guess.
 - Use `render_chart` for comparisons/trends that read better as a chart.
   Only chart real numbers already fetched this turn.
 
@@ -168,7 +189,16 @@ silently averaging. Convert raw units — $391,035,000,000 → $391.0B.
             f"the same way (e.g. \"as established earlier, ...\").\n"
         )
 
-    if active_ticker:
+    if active_tickers and len(active_tickers) > 1:
+        # Several companies are in focus (e.g. an 8-company comparison). The old
+        # single-ticker sentence told the model the topic was the FIRST one.
+        base += (
+            f"\n## Conversation context\n"
+            f"The companies under discussion are **{', '.join(active_tickers)}**. "
+            f"A bare \"it\" or \"its\" is ambiguous with several companies: resolve it "
+            f"only if the question makes it clear, otherwise say which one you assumed.\n"
+        )
+    elif active_ticker:
         base += (
             f"\n## Conversation context\n"
             f"The company currently under discussion is **{active_ticker}**. "
@@ -176,6 +206,9 @@ silently averaging. Convert raw units — $391,035,000,000 → $391.0B.
             f"last year\") against this ticker unless the user clearly switches "
             f"to a different company.\n"
         )
+    if brief:
+        from nodes.query_understanding import brief_for_prompt
+        base += brief_for_prompt(brief)
 
     if not tools_available:
         base += (
@@ -289,61 +322,120 @@ def _looks_like_tool_use_failure(exc: Exception) -> bool:
     return bool(_TOOL_FAILURE_SHAPE.search(str(exc)))
 
 
-def _condense_for_rescue(preserved_results: list[dict], max_chars: int = 2500) -> str:
-    """Renders preserved tool results as compact plain text — NOT the
-    original tool-call-and-response message shape. This is the whole point:
-    the model sees "here is data" as ordinary text, not a transcript of
-    itself calling tools, which is what the rescue path exists to avoid
-    replaying."""
-    lines: list[str] = []
-    remaining = max_chars
-    for record in preserved_results:
-        header = f"[{record.get('tool', '?')}] {record.get('args', {})}"
-        body = str(record.get("result") or "")
-        block = f"{header}\n{body}"[: max(200, remaining // max(1, len(preserved_results)))]
-        lines.append(block)
-        remaining -= len(block)
-        if remaining <= 0:
-            break
-    return "\n\n".join(lines)
+def _condense_for_rescue(preserved_results: list[dict], max_chars: int = 4000) -> str:
+    """
+    Renders saved tool results as plain text (NOT the original tool-call /
+    tool-response message shape — that history is what the rescue exists to
+    avoid replaying).
+
+    The character budget is shared FAIRLY. The previous version re-divided
+    whatever was left by the TOTAL count on every pass, so with 5 companies
+    the first kept ~500 chars and the last ~205 — later companies were
+    silently cut harder, mid-table. Now: a result shorter than its fair share
+    keeps everything and the unused budget is handed to the longer ones, and
+    anything cut carries an explicit [truncated] marker so the model knows the
+    data is incomplete instead of treating a cut table as the full table.
+    """
+    blocks = [
+        f"[{r.get('tool', '?')}] {r.get('args', {})}\n{str(r.get('result') or '')}"
+        for r in preserved_results
+    ]
+    return "\n\n".join(fair_share(blocks, max_chars)) if blocks else ""
+
+
+def _plain_history(messages: list, keep: int = 4, per_msg_chars: int = 600) -> str:
+    """
+    Earlier questions and final answers of this conversation as PLAIN TEXT.
+
+    Without this the rescue only saw the current sentence, so a follow-up like
+    "I asked for full year gdp so add them all" lost what "them" referred to.
+    Tool calls and tool results are deliberately excluded — only messages a
+    person would recognise as part of the conversation — so this cannot
+    reintroduce the tool-call history the rescue is built to avoid.
+    """
+    last_human = max(
+        (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=None
+    )
+    earlier = messages[:last_human] if last_human is not None else []
+    lines = []
+    for m in earlier:
+        content = str(getattr(m, "content", "") or "").strip()
+        if not content:
+            continue
+        if isinstance(m, HumanMessage):
+            role = "User"
+        elif isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+            role = "Assistant"
+        else:
+            continue
+        if len(content) > per_msg_chars:
+            content = content[:per_msg_chars] + "…"
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines[-keep:])
 
 
 def _attempt_rescue_synthesis(
     user_question: str,
     preserved_results: list[dict],
     active_ticker: str | None,
+    conversation_summary: str | None = None,
+    contradiction_note: str | None = None,
+    history_text: str = "",
+    active_tickers: list[str] | None = None,
+    brief: dict | None = None,
 ) -> str | None:
     """
-    One last synthesis attempt using a MINIMAL, fresh message list — no
-    tools bound at all (not even tool_choice="none", which itself requires
-    a `tools` field Groq validates against), and no prior tool-call
-    messages in the history. Returns the answer text, or None if this also
-    fails — in which case the caller falls back to the raw partial response.
+    One last synthesis attempt with a FRESH, minimal message list — no tools
+    declared, and no prior tool-call messages. Returns the answer text, or
+    None if this also fails (caller then falls back to the raw partial
+    response).
+
+    It now uses the same _system_prompt() builder as the normal path, in its
+    tools_available=False mode ("you have used your tool budget... answer NOW
+    ... do not claim you will fetch anything"). That brings back what the
+    hand-written rescue prompt dropped: the citation/tier rules, the rolling
+    conversation summary, and the cross-source contradiction note. Previously
+    a rescued answer could ignore a conflict the UI banner was showing.
     """
-    rescue_prompt = (
-        "You are a financial research assistant. Below is data that was "
-        "already retrieved for the user's question. Write a direct, "
-        "complete answer using ONLY these numbers — do not request any "
-        "additional data, you have no ability to fetch more right now. "
-        "Cite each figure's source plainly (e.g. 'per financial_data_api'). "
-        "If the data doesn't fully answer the question, say what's missing "
-        "and answer with what's available. Do not mention tools, errors, "
-        "or that anything went wrong — just answer the question."
+    system_text = _system_prompt(
+        active_ticker,
+        tools_available=False,
+        conversation_summary=conversation_summary,
+        contradiction_note=contradiction_note,
+        active_tickers=active_tickers,
+        brief=brief,
     )
-    ticker_note = f"\n\nCompany in focus: {active_ticker}" if active_ticker else ""
+    if active_tickers and len(active_tickers) > 1:
+        ticker_note = f"\n\nCompanies in focus: {', '.join(active_tickers)}"
+    else:
+        ticker_note = f"\n\nCompany in focus: {active_ticker}" if active_ticker else ""
+    history_block = (
+        f"Earlier in this conversation (context only):\n{history_text}\n\n"
+        if history_text else ""
+    )
     user_content = (
         f"Question: {user_question}{ticker_note}\n\n"
-        f"Retrieved data:\n{_condense_for_rescue(preserved_results)}"
+        f"{history_block}"
+        f"Retrieved data (already fetched this turn):\n"
+        f"{_condense_for_rescue(preserved_results)}\n\n"
+        "Write the answer now using only the retrieved data above. You cannot "
+        "fetch or calculate anything further. Do not do multi-digit arithmetic "
+        "yourself: if a derived figure was not already computed above, give its "
+        "inputs and say it was not calculated. If a needed figure is missing, "
+        "say so plainly. Do not mention tools or errors."
     )
 
     try:
-        # Deliberately NOT using get_llm's with_tools/tool_choice at all —
-        # a request with zero tools declared has nothing for Groq's
-        # validator to reject a tool call against being absent from.
-        llm = get_llm(temperature=0.2, max_tokens=1500)
+        # Deliberately NOT using get_llm's with_tools/tool_choice: a request
+        # with zero tools declared has nothing for Groq's validator to reject
+        # a tool call against. max_tokens is 2000 (was 1500) because on
+        # reasoning models that budget also pays for the model's thinking; a
+        # trace showed one call spend 1,361 tokens on reasoning alone, which
+        # would leave 1500 almost nothing for the visible answer.
+        llm = get_llm(temperature=0.2, max_tokens=2000)
         response = invoke_with_retry(
             llm,
-            [SystemMessage(content=rescue_prompt), HumanMessage(content=user_content)],
+            [SystemMessage(content=system_text), HumanMessage(content=user_content)],
         )
         text = str(response.content or "").strip()
         return text if text else None
@@ -355,7 +447,12 @@ def _attempt_rescue_synthesis(
 def chat_agent_node(state: ChatState) -> dict:
     """One reasoning step: either emit tool calls, or emit the final answer."""
     loops = state.get("tool_loops", 0)
-    budget_left = loops < CHAT_MAX_TOOL_LOOPS
+    # Tools withdrawn this turn (systemic failure) are not even bound: the model
+    # cannot pick a tool it is not shown, and the schemas it no longer carries
+    # save tokens. _run_one still refuses them if it hallucinates one anyway.
+    disabled = set(state.get("disabled_tools") or [])
+    active_tools = [t for t in CHAT_TOOLS if t.name not in disabled]
+    budget_left = loops < CHAT_MAX_TOOL_LOOPS and bool(active_tools)
 
     history = _window_messages(state.get("messages", []))
 
@@ -376,12 +473,14 @@ def chat_agent_node(state: ChatState) -> dict:
         tools_available=budget_left,
         conversation_summary=state.get("conversation_summary"),
         contradiction_note=contradiction_note,
+        active_tickers=state.get("active_tickers"),
+        brief=state.get("brief"),
     )
     messages = [SystemMessage(content=prompt)] + history
 
     try:
         if budget_left:
-            llm = get_llm(temperature=0.2, max_tokens=2048, with_tools=CHAT_TOOLS)
+            llm = get_llm(temperature=0.2, max_tokens=2048, with_tools=active_tools)
         else:
             # Final round. Tools stay BOUND but tool_choice is explicitly
             # "none" — see utils/groq_client._FallbackChatGroq._build for why
@@ -391,7 +490,7 @@ def chat_agent_node(state: ChatState) -> dict:
             print(f"[ChatAgent] Tool budget exhausted ({loops}) — forcing final answer.")
             llm = get_llm(
                 temperature=0.2, max_tokens=2048,
-                with_tools=CHAT_TOOLS, tool_choice="none",
+                with_tools=active_tools or CHAT_TOOLS, tool_choice="none",
             )
 
         response = invoke_with_retry(llm, messages)
@@ -429,6 +528,11 @@ def chat_agent_node(state: ChatState) -> dict:
                 user_question=state.get("user_input", ""),
                 preserved_results=preserved,
                 active_ticker=state.get("active_ticker"),
+                conversation_summary=state.get("conversation_summary"),
+                contradiction_note=contradiction_note,
+                history_text=_plain_history(state.get("messages", [])),
+                active_tickers=state.get("active_tickers"),
+                brief=state.get("brief"),
             )
             if rescued:
                 print("[ChatAgent] Rescue synthesis succeeded.")
@@ -436,6 +540,10 @@ def chat_agent_node(state: ChatState) -> dict:
                     "messages": [AIMessage(content=rescued)],
                     "turn_status": COMPLETE,
                     "contradictions_detected": contradictions if contradictions else None,
+                    # Tagged so evaluation can tell a rescued answer from a
+                    # normal one — both are COMPLETE, but the rescue ran with
+                    # narrower context and should be measured separately.
+                    "synthesis_mode": "rescue",
                 }
             print("[ChatAgent] Rescue synthesis also failed — falling back to partial response.")
 
@@ -522,51 +630,142 @@ def chat_agent_node(state: ChatState) -> dict:
 #  Tool node
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_one(tool_call: dict) -> dict:
-    """Executes a single tool call and returns a structured trace record."""
+def _call_key(name: str, args: dict) -> str:
+    """Stable identity of a tool call (name + arguments) for repeat detection."""
+    return f"{name}|{json.dumps(args, sort_keys=True, default=str)}"
+
+
+def _run_one(
+    tool_call: dict,
+    disabled: frozenset = frozenset(),
+    failed_calls: frozenset = frozenset(),
+) -> dict:
+    """
+    Executes ONE tool call under the failure policy, and returns a trace record.
+
+    Policy, by failure type (see utils/error_classifier.py):
+      TRANSIENT (timeout, dropped connection, 5xx) -> retried ONCE here, after a
+          short pause, with no model involved. A blip needs no reasoning, and
+          routing it through the model costs a whole round of the 4-round budget
+          plus an LLM call (~5-6k prompt tokens in production traces).
+      SYSTEMIC (bad/missing key, persistent rate limit) -> never retried. The
+          caller withdraws the tool for the rest of the turn; if the model asks
+          for it anyway it is refused here without executing.
+      BAD_ARGS -> NOT retried here: the arguments must change, and only the
+          model can change them. It is told what went wrong. An identical repeat
+          of a call that already failed this way is refused (same args, same
+          error — it can only waste a round).
+      LEGITIMATE_EMPTY -> returned with an explicit "stop, this is the answer".
+    """
     name = tool_call["name"]
     args = tool_call.get("args", {}) or {}
     started = time.time()
 
-    tool = TOOLS_BY_NAME.get(name)
-    if tool is None:
+    def record(status: str, content: str, error_class: str, retries: int = 0) -> dict:
         return {
-            "tool": name,
-            "args": args,
-            "status": "failed",
-            "content": f"Unknown tool '{name}'. Available: {', '.join(TOOLS_BY_NAME)}",
-            "duration_s": 0.0,
-            "tool_call_id": tool_call["id"],
+            "tool": name, "args": args, "status": status,
+            "error_class": error_class, "content": content,
+            "duration_s": round(time.time() - started, 2),
+            "tool_call_id": tool_call["id"], "retries": retries,
         }
 
-    try:
-        raw = str(tool.invoke(args))
-        # Reuses the report pipeline's taxonomy so "no filings found" and
-        # "auth failed" stay distinguishable in chat too. The distinction
-        # matters for the model's next move: an empty result means stop asking,
-        # a failure means try a different route.
-        status_code = classify_result(name, raw)
-        status = {
-            OK: "success",
-            LEGITIMATE_EMPTY: "empty",
-        }.get(status_code, "failed")
-        content = raw
-        if status == "empty" and not raw.strip():
-            content = f"[{name}] No data available for these arguments."
-    except Exception as exc:
-        status = "failed"
-        status_code = "systemic"
-        content = f"[{name}] Error: raised {type(exc).__name__}: {exc}"
+    tool = TOOLS_BY_NAME.get(name)
+    if tool is None:
+        return record("failed", f"Unknown tool '{name}'. Available: {', '.join(TOOLS_BY_NAME)}", BAD_ARGS)
 
-    return {
-        "tool": name,
-        "args": args,
-        "status": status,
-        "error_class": status_code,
-        "content": content,
-        "duration_s": round(time.time() - started, 2),
-        "tool_call_id": tool_call["id"],
-    }
+    if name in disabled:
+        return record(
+            "failed",
+            f"[{name}] Unavailable for the rest of this turn: it failed earlier with an "
+            f"error that retrying cannot fix (e.g. missing/invalid API key or a rate "
+            f"limit). Do not call it again — use a different source or answer with "
+            f"what you already have.",
+            SYSTEMIC,
+        )
+    if _call_key(name, args) in failed_calls:
+        return record(
+            "failed",
+            f"[{name}] This exact call already failed earlier this turn because of its "
+            f"arguments. Do not repeat it unchanged — correct the arguments or take a "
+            f"different approach.",
+            BAD_ARGS,
+        )
+
+    retries = 0
+    category = OK
+    raw = ""
+    for attempt in range(LOCAL_RETRY_LIMIT + 1):
+        try:
+            raw = str(tool.invoke(args))
+        except Exception as exc:
+            # Classified from its text like any other failure. This used to be
+            # hard-wired to "systemic", so a plain TypeError (bad arguments)
+            # or a dropped connection was treated as a permanently broken tool.
+            raw = f"[{name}] Error: raised {type(exc).__name__}: {exc}"
+        category = classify_result(name, raw)
+        if category == TRANSIENT and attempt < LOCAL_RETRY_LIMIT:
+            retries += 1
+            time.sleep(TRANSIENT_RETRY_PAUSE_S)
+            continue
+        break
+
+    # The classification is reused from the report pipeline so "no filings
+    # found" and "auth failed" stay distinguishable in chat too. An empty result
+    # means stop asking; a failure means the model should try a different route.
+    status = {OK: "success", LEGITIMATE_EMPTY: "empty"}.get(category, "failed")
+    content = raw
+    if status == "empty":
+        if not raw.strip():
+            content = f"[{name}] No data available for these arguments."
+        content += ("\n[No data exists for these arguments — this is a valid result. "
+                    "Do not retry; tell the user it is not available.]")
+    return record(status, content, category, retries)
+
+
+def _multi_token(value) -> bool:
+    """True for a `ticker` string that actually carries several tickers."""
+    return isinstance(value, str) and bool(_re.search(r"[,;\s]", value.strip()))
+
+
+def _expand_batch_calls(tool_calls: list[dict]) -> tuple[list[dict], dict[str, dict]]:
+    """
+    Turns financial_data_api(tickers=[A, B, C]) into one internal call per company.
+
+    Why here and not inside the tool: each company then runs through _run_one like
+    any other tool call — its own retry-on-transient, withdraw-on-systemic, trace
+    row and preserved result — instead of being buried inside one opaque call.
+    The model still sees ONE call and gets ONE ToolMessage back (providers require
+    exactly one reply per tool_call_id); see the merge in chat_tool_node.
+
+    Returns (internal_calls, groups) where groups maps an original call id to
+    {"ids": [internal ids], "skipped": [tickers not fetched]}.
+    """
+    from tools import normalize_tickers
+
+    internal: list[dict] = []
+    groups: dict[str, dict] = {}
+    budget = CHAT_MAX_BATCH_TICKERS          # companies fetched per round, all batch calls together
+    for tc in tool_calls:
+        args = dict(tc.get("args") or {})
+        if tc["name"] != "financial_data_api" or not (args.get("tickers") or _multi_token(args.get("ticker"))):
+            internal.append(tc)
+            continue
+        kept, skipped = normalize_tickers(args.get("ticker"), args.get("tickers"), limit=max(budget, 0))
+        if not kept:
+            internal.append(tc)              # let the tool answer with its own clear error
+            continue
+        budget -= len(kept)
+        base = {k: v for k, v in args.items() if k not in ("ticker", "tickers")}
+        if len(kept) == 1 and not skipped:
+            internal.append({**tc, "args": {**base, "ticker": kept[0]}})
+            continue
+        ids = []
+        for i, ticker in enumerate(kept):
+            call_id = f"{tc['id']}::{i}"
+            ids.append(call_id)
+            internal.append({"name": tc["name"], "id": call_id, "args": {**base, "ticker": ticker}})
+        groups[tc["id"]] = {"ids": ids, "skipped": skipped}
+    return internal, groups
 
 
 def chat_tool_node(state: ChatState) -> dict:
@@ -576,6 +775,10 @@ def chat_tool_node(state: ChatState) -> dict:
     Parallel by default via ThreadPoolExecutor — these are all network-bound,
     so concurrency is close to free and cuts perceived latency a lot when the
     agent fans out (e.g. two companies' income statements at once).
+
+    A financial_data_api call that carries a `tickers` list is expanded here into
+    one parallel fetch per company (see _expand_batch_calls), so a multi-company
+    question needs ONE model round however many companies it names.
 
     Exception: CHAT_SERIAL_TOOLS (Alpha Vantage) run one at a time, because
     they share a per-minute rate limiter and firing them concurrently just
@@ -590,25 +793,37 @@ def chat_tool_node(state: ChatState) -> dict:
     if not tool_calls:
         return {}
 
-    parallel = [tc for tc in tool_calls if tc["name"] not in CHAT_SERIAL_TOOLS]
-    serial = [tc for tc in tool_calls if tc["name"] in CHAT_SERIAL_TOOLS]
+    internal_calls, groups = _expand_batch_calls(tool_calls)
+    parallel = [tc for tc in internal_calls if tc["name"] not in CHAT_SERIAL_TOOLS]
+    serial = [tc for tc in internal_calls if tc["name"] in CHAT_SERIAL_TOOLS]
 
     results: list[dict] = []
+
+    # Failure memory for this turn, rebuilt from state (both lists are reset
+    # every turn by the intent router).
+    disabled = frozenset(state.get("disabled_tools") or [])
+    failed_calls = frozenset(
+        _call_key(t["tool"], t.get("args") or {})
+        for t in (state.get("tool_trace") or [])
+        if t.get("status") == "failed" and t.get("error_class") == BAD_ARGS
+    )
+    run_one = partial(_run_one, disabled=disabled, failed_calls=failed_calls)
 
     if parallel:
         workers = min(len(parallel), CHAT_MAX_PARALLEL_TOOL_CALLS)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            results.extend(pool.map(_run_one, parallel))
+            results.extend(pool.map(run_one, parallel))
 
     for tool_call in serial:
-        results.append(_run_one(tool_call))
+        results.append(run_one(tool_call))
 
     # Restore the model's original ordering so the ToolMessages line up with
     # the tool_calls array in the order the model expects to read them.
     by_id = {r["tool_call_id"]: r for r in results}
-    ordered = [by_id[tc["id"]] for tc in tool_calls if tc["id"] in by_id]
+    ordered = [by_id[tc["id"]] for tc in internal_calls if tc["id"] in by_id]
+    grouped_ids = {cid for g in groups.values() for cid in g["ids"]}
 
-    tool_messages: list[BaseMessage] = []
+    message_by_id: dict[str, BaseMessage] = {}
     trace: list[dict[str, Any]] = []
     preserved: list[dict[str, Any]] = []
 
@@ -622,9 +837,12 @@ def chat_tool_node(state: ChatState) -> dict:
                 "you need the complete filing text.]"
             )
 
-        tool_messages.append(
-            ToolMessage(content=content, tool_call_id=result["tool_call_id"], name=result["tool"])
-        )
+        # Members of a batch are NOT given a ToolMessage of their own; they are
+        # merged into the one message for the call the model actually made.
+        if result["tool_call_id"] not in grouped_ids:
+            message_by_id[result["tool_call_id"]] = ToolMessage(
+                content=content, tool_call_id=result["tool_call_id"], name=result["tool"]
+            )
 
         print(
             f"[ChatTools] {result['tool']} -> {result['status']} "
@@ -637,6 +855,7 @@ def chat_tool_node(state: ChatState) -> dict:
                 "args": result["args"],
                 "status": result["status"],
                 "error_class": result.get("error_class"),
+                "retries": result.get("retries", 0),
                 "duration_s": result["duration_s"],
                 "chars": len(result["content"]),
                 "truncated": truncated,
@@ -647,7 +866,9 @@ def chat_tool_node(state: ChatState) -> dict:
         # synthesis failure can still show the user real data. Note this
         # stores result["content"], not the truncated `content` above — the
         # truncation exists to protect the LLM's context window, and has no
-        # bearing on what a human can usefully be shown.
+        # bearing on what a human can usefully be shown. For a batch this is
+        # per COMPANY, so contradiction detection, the rescue prompt and the
+        # evaluation judge all still see each company separately.
         if result["status"] == "success":
             preserved.append(
                 {
@@ -658,10 +879,39 @@ def chat_tool_node(state: ChatState) -> dict:
                 }
             )
 
+    # One merged message per batch call. The companies share one context budget
+    # (twice the single-result cap, split fairly) because eight full statements
+    # at the single-result cap would overflow the token window and be dropped.
+    from tools import merge_batch_results
+    for call_id, group in groups.items():
+        members = [by_id[cid] for cid in group["ids"] if cid in by_id]
+        bodies = fair_share([m["content"] for m in members], CHAT_TOOL_RESULT_MAX_CHARS * 2)
+        entries = [
+            {"ticker": m["args"].get("ticker", "?"), "status": m["status"], "content": body}
+            for m, body in zip(members, bodies)
+        ]
+        message_by_id[call_id] = ToolMessage(
+            content=merge_batch_results(entries, group["skipped"]),
+            tool_call_id=call_id, name="financial_data_api",
+        )
+        print(f"[ChatTools] financial_data_api batch of {len(members)} companies merged into one reply")
+
+    tool_messages = [message_by_id[tc["id"]] for tc in tool_calls if tc["id"] in message_by_id]
+
+    # Withdraw tools that just failed systemically. Never None: with the
+    # reset_or_append reducer None would CLEAR the list, [] appends nothing.
+    newly_disabled = sorted({
+        r["tool"] for r in ordered
+        if r["status"] == "failed" and r.get("error_class") == SYSTEMIC
+        and r["tool"] not in disabled and r["tool"] in TOOLS_BY_NAME
+    })
+    if newly_disabled:
+        print(f"[ChatTools] Withdrawing for the rest of this turn: {', '.join(newly_disabled)}")
     return {
         "messages": tool_messages,
         "tool_trace": trace,
         "successful_tool_results": preserved,
+        "disabled_tools": newly_disabled,
         "tool_loops": state.get("tool_loops", 0) + 1,
     }
 
@@ -683,6 +933,19 @@ downloadable research report with charts if they ask for one.
 Do not invent any numbers. Do not list your tools as a long bulleted menu."""
 
 
+_OUT_OF_SCOPE_PROMPT = """You are a financial research assistant. The user asked something
+outside finance. In at most 3 short sentences: if it is harmless and trivial you may
+answer it very briefly, then say plainly that you focus on financial research and
+invite a question about companies, filings, earnings, valuation or macro data.
+Do not invent facts or numbers."""
+
+_OUT_OF_SCOPE_FALLBACK = (
+    "That's outside what I do — I'm a financial research assistant. Ask me about a "
+    "company's financials, filings, earnings, valuation, or macro data and I'll "
+    "pull real numbers."
+)
+
+
 def smalltalk_node(state: ChatState) -> dict:
     """
     Handles greetings without binding tools or loading the full analyst prompt.
@@ -695,13 +958,18 @@ def smalltalk_node(state: ChatState) -> dict:
     history = _window_messages(state.get("messages", []))[-6:]
     llm = get_llm(temperature=0.4, max_tokens=300)
 
+    # The understanding step judged the message not to be about finance: same cheap
+    # path as small talk (no tools, no analyst prompt), but it redirects the user.
+    out_of_scope = state.get("intent") == INTENT_OUT_OF_SCOPE
+    prompt = _OUT_OF_SCOPE_PROMPT if out_of_scope else _SMALLTALK_PROMPT
+
     try:
-        response = invoke_with_retry(
-            llm, [SystemMessage(content=_SMALLTALK_PROMPT)] + history
-        )
+        response = invoke_with_retry(llm, [SystemMessage(content=prompt)] + history)
         return {"messages": [response]}
     except Exception as exc:
         print(f"[Smalltalk] LLM failed: {exc}")
+        if out_of_scope:
+            return {"messages": [AIMessage(content=_OUT_OF_SCOPE_FALLBACK)]}
         return {
             "messages": [
                 AIMessage(

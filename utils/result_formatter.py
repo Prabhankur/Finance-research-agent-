@@ -148,9 +148,19 @@ def build_partial_response(
         "",
         f"**Technical detail:** `{detail}`",
         "",
-        "Asking again will reuse nothing — re-running costs another set of "
-        "API calls — so if the figures above answer your question, work from "
-        "them directly.",
+        # Previously said "re-running costs another set of API calls" —
+        # that was MISLEADING. The tool calls shown above already succeeded
+        # and are cached: asking again reuses them with ZERO new calls to
+        # the data providers. What genuinely cannot be reused is the
+        # SYNTHESIS step — the LLM call that writes the analysis — since
+        # that is exactly what failed. A user who read "costs another API
+        # call" would reasonably assume the whole turn refetches data,
+        # which undersells the caching layer and is simply not true.
+        "Asking again will reuse the data above from cache — no new API "
+        "calls to the data providers — but will need a fresh attempt at "
+        "writing the analysis, since that's the step that failed. If the "
+        "figures above already answer your question, you can work from "
+        "them directly instead.",
     ]
 
     return "\n".join(parts)

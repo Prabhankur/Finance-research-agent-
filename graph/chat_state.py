@@ -101,6 +101,19 @@ class ChatState(TypedDict, total=False):
     # answer actually acknowledged the disagreement or hid it.
     contradictions_detected: Annotated[list[dict[str, Any]], reset_or_append]
 
+    # "rescue" when the answer came from the fresh-prompt rescue synthesis
+    # (see nodes/chat_agent._attempt_rescue_synthesis), else None. Plain value,
+    # no reducer, reset every turn by the intent router. Lets the evaluator
+    # separate rescued answers from normal ones in its statistics.
+    synthesis_mode: Optional[str]
+
+    # Tools that failed SYSTEMICALLY this turn (bad/missing API key, persistent
+    # rate limit...) — retrying cannot help, so they are withdrawn for the rest
+    # of the turn: not offered to the model, and refused if it asks anyway.
+    # Per-turn; the intent router resets it, so a tool gets a fresh chance on
+    # the user's next message.
+    disabled_tools: Annotated[list[str], reset_or_append]
+
     # ── Rolling memory ────────────────────────────────────────────────────────
     # Set only by nodes/summarizer.py, read only by chat_agent's system prompt.
     # Plain str with NO reducer: whoever writes it overwrites it wholesale,
@@ -115,3 +128,14 @@ class ChatState(TypedDict, total=False):
     # Sticky context so "and its margins?" resolves without re-stating the
     # company. Updated opportunistically whenever a ticker is seen.
     active_ticker: Optional[str]
+
+    # Every company / index in focus, not just one. A question about eight
+    # companies used to be stored as the first one only, and the prompt then
+    # told the model the topic was that company. `active_ticker` stays as the
+    # primary (first) entry so older readers keep working. Plain list, no
+    # reducer: whoever writes it overwrites it, and the router writes it every turn.
+    active_tickers: Optional[list[str]]
+
+    # The understanding step's brief for THIS turn (scope, subjects, metrics,
+    # period, assumptions) — see nodes/query_understanding.py. Reset every turn.
+    brief: Optional[dict]

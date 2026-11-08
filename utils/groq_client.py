@@ -15,6 +15,7 @@ Model selection order:
 from __future__ import annotations
 import os
 import re
+import time
 from typing import Optional
 from langchain_groq import ChatGroq
 
@@ -139,6 +140,31 @@ def _ordered_candidates(env_model: str) -> list[str]:
     return candidates
 
 
+# Models whose DAILY token quota ran out, remembered across calls so each new
+# request does not first re-try a model that is certain to fail. Groq's rate
+# limits are per model (the error text itself reads "Rate limit reached for
+# model X"), so exhausting one model does not exhaust the others.
+_DAILY_EXHAUSTED: dict[str, tuple[float, str]] = {}
+_DAILY_EXHAUSTED_TTL_S = 900          # re-test after 15 min, in case the quota reset
+
+
+def _daily_exhausted(model: str) -> Optional[str]:
+    """The stored error text if `model` was found daily-exhausted recently."""
+    entry = _DAILY_EXHAUSTED.get(model)
+    if entry is None:
+        return None
+    if time.time() - entry[0] > _DAILY_EXHAUSTED_TTL_S:
+        _DAILY_EXHAUSTED.pop(model, None)
+        return None
+    return entry[1]
+
+
+def _is_daily_limit_error(error_text: str) -> bool:
+    """A 429 whose quota is per DAY (TPD), as opposed to per minute (TPM)."""
+    return (("429" in error_text or "rate_limit_exceeded" in error_text)
+            and bool(re.search(r"per day|\btpd\b", error_text, re.IGNORECASE)))
+
+
 class _FallbackChatGroq:
     """
     Drop-in stand-in for a single ChatGroq instance that transparently
@@ -246,6 +272,12 @@ class _FallbackChatGroq:
         for model in self._candidates:
             if model in self._tried:
                 continue
+            known = _daily_exhausted(model)
+            if known:
+                print(f"[GroqClient] Skipping '{model}': daily quota exhausted (seen recently).")
+                self._tried.add(model)
+                last_exc = RuntimeError(known)
+                continue
             if model != self._current_model:
                 self._current_llm = self._build(model)
             try:
@@ -281,6 +313,18 @@ class _FallbackChatGroq:
                     print(
                         f"[GroqClient] Model '{model}' unavailable at invoke "
                         f"time ({exc}). Trying next candidate..."
+                    )
+                    self._tried.add(model)
+                    last_exc = exc
+                    continue
+                if _is_daily_limit_error(error_text):
+                    # This model's DAILY quota is gone and waiting cannot help
+                    # (it resets on a daily cycle). Another model has its own
+                    # quota, so move on instead of failing the whole request.
+                    _DAILY_EXHAUSTED[model] = (time.time(), error_text)
+                    print(
+                        f"[GroqClient] Daily quota exhausted on '{model}'. "
+                        f"Trying next candidate..."
                     )
                     self._tried.add(model)
                     last_exc = exc
@@ -341,6 +385,39 @@ def get_llm(
 
     print(f"[GroqClient] Primary candidate: {candidates[0]}")
     return _FallbackChatGroq(candidates, temperature, max_tokens, with_tools, tool_choice)
+
+
+_TRANSIENT_ERROR_PATTERNS = (
+    "connection error",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "remote end closed",
+    "read timeout",
+    "max retries exceeded",
+    "temporary failure",
+    "name or service not known",   # DNS resolution failure
+    "503",   # Groq-side service unavailable
+    "502",   # bad gateway
+    "504",   # gateway timeout
+)
+
+
+def _is_transient_connection_error(exc: Exception) -> bool:
+    """
+    True for network-level failures reaching Groq's servers at all — as
+    opposed to the model returning a well-formed error response (400, 429,
+    401, model_not_found). Those are handled by their own specific paths;
+    this catches the class of error that happens BEFORE any response comes
+    back, so there's nothing to parse — just a dropped connection, a DNS
+    hiccup, or Groq's edge being briefly unavailable. These are usually
+    gone on the very next attempt, which is why they get a short retry
+    instead of immediately falling through to partial results.
+    """
+    err_str = str(exc).lower()
+    return any(pattern in err_str for pattern in _TRANSIENT_ERROR_PATTERNS)
 
 
 def invoke_with_retry(
@@ -411,6 +488,11 @@ def invoke_with_retry(
                 wait_secs = float(wait_match.group(1)) if wait_match else (attempt * 8)
                 wait_secs = min(wait_secs + 2, 65)   # add 2s buffer, cap at 65s
 
+                if attempt >= max_retries:
+                    # Out of attempts. Sleeping here used to add a pointless
+                    # wait (5-65 s) before reporting a failure that was already
+                    # certain.
+                    break
                 print(
                     f"[GroqClient] 429 rate limit (attempt {attempt}/{max_retries}). "
                     f"Sleeping {wait_secs:.0f}s..."
@@ -418,7 +500,31 @@ def invoke_with_retry(
                 time.sleep(wait_secs)
                 continue   # retry
 
-            # Non-rate-limit error → raise immediately
+            # ── Transient network failures — retry with short backoff ──────
+            # Real production trace: 4 financial_data_api calls succeeded
+            # (fast, cache-assisted — caching was NOT the problem), but the
+            # final synthesis call to Groq failed with a raw "Connection
+            # error." — a network-level failure reaching Groq's servers,
+            # not a model or tool problem. The old code treated every
+            # non-429 error as permanent and raised immediately, so a
+            # one-off network blip threw away 4 successful tool calls'
+            # worth of work and fell all the way to partial results — the
+            # system's LAST line of defense, not its first. A transient
+            # connection error is usually gone on the very next attempt and
+            # deserves a real retry here, before escalating.
+            if _is_transient_connection_error(exc):
+                if attempt >= max_retries:
+                    raise
+                wait_secs = min(2 ** attempt, 20)   # 2s, 4s, 8s, 16s, 20s cap
+                print(
+                    f"[GroqClient] Transient connection error (attempt "
+                    f"{attempt}/{max_retries}): {err_str[:120]}. "
+                    f"Retrying in {wait_secs}s..."
+                )
+                time.sleep(wait_secs)
+                continue   # retry
+
+            # Non-rate-limit, non-transient error → raise immediately
             raise
 
     raise RuntimeError(

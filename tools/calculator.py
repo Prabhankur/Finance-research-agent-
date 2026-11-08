@@ -23,6 +23,79 @@ def _safe(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _sum(values: list) -> str:
+    """
+    Add a list of numbers. This exists because the system prompt instructs
+    the model to use the calculator for ALL arithmetic — but before this,
+    the calculator only supported financial formulas (CAGR, margins, etc.)
+    and had no way to do plain addition. A real production trace showed the
+    model asked to "add four quarters of GDP", unable to find an add
+    operation, spiralling through ~30 repetitions of "calculator with metric
+    cagr? Not appropriate" and finally emitting wrong CAGR calls. The tool's
+    capabilities must match what the prompt promises.
+    """
+    nums = [_safe(v) for v in (values or [])]
+    if not nums:
+        return "Error: provide a non-empty 'values' list to sum."
+    return f"Sum = {sum(nums):,.2f}"
+
+
+def _subtract(values: list) -> str:
+    """Subtract sequentially: values[0] - values[1] - values[2] ..."""
+    nums = [_safe(v) for v in (values or [])]
+    if len(nums) < 2:
+        return "Error: subtract needs at least 2 values."
+    result = nums[0]
+    for n in nums[1:]:
+        result -= n
+    return f"Difference = {result:,.2f}"
+
+
+def _multiply(values: list) -> str:
+    """Multiply a list of numbers together."""
+    nums = [_safe(v) for v in (values or [])]
+    if not nums:
+        return "Error: provide a non-empty 'values' list to multiply."
+    result = 1.0
+    for n in nums:
+        result *= n
+    return f"Product = {result:,.2f}"
+
+
+def _divide(values: list) -> str:
+    """Divide sequentially: values[0] / values[1] / values[2] ..."""
+    nums = [_safe(v) for v in (values or [])]
+    if len(nums) < 2:
+        return "Error: divide needs at least 2 values."
+    result = nums[0]
+    for n in nums[1:]:
+        if n == 0:
+            return "Error: division by zero."
+        result /= n
+    return f"Quotient = {result:,.4f}"
+
+
+def _average(values: list) -> str:
+    """Arithmetic mean of a list of numbers."""
+    nums = [_safe(v) for v in (values or [])]
+    if not nums:
+        return "Error: provide a non-empty 'values' list to average."
+    return f"Average = {sum(nums) / len(nums):,.2f}"
+
+
+def _percent_change(start_value: float, end_value: float) -> str:
+    """
+    Simple percentage change between two values — NOT annualized.
+    Distinct from CAGR: use this for 'how much did X change from A to B',
+    use CAGR only for multi-year compound growth.
+    """
+    sv = _safe(start_value)
+    if sv == 0:
+        return "Error: start_value cannot be zero."
+    result = (_safe(end_value) - sv) / sv * 100
+    return f"Percent Change = {result:.2f}%"
+
+
 def cagr(start_value: float, end_value: float, years: float) -> str:
     """Compound Annual Growth Rate."""
     if start_value <= 0 or years <= 0:
@@ -126,10 +199,6 @@ def gross_margin(revenue: float, cogs: float = None, gross_profit: float = None)
         return "Error: revenue cannot be zero."
     result = _safe(gross_profit) / _safe(revenue) * 100
     return f"Gross Margin = {result:.2f}%"
-    if revenue == 0:
-        return "Error: revenue cannot be zero."
-    result = (_safe(revenue) - _safe(cogs)) / _safe(revenue) * 100
-    return f"Gross Margin = {result:.2f}%"
 
 
 def revenue_growth(current_revenue: float, prior_revenue: float) -> str:
@@ -180,6 +249,9 @@ def interest_coverage(ebit: float, interest_expense: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SUPPORTED_METRICS = [
+    # Basic arithmetic — operate on a `values` list
+    "sum", "subtract", "multiply", "divide", "average", "percent_change",
+    # Financial formulas
     "cagr", "free_cash_flow", "fcf_yield", "altman_z_score",
     "debt_to_equity", "current_ratio", "gross_margin", "revenue_growth",
     "peg_ratio", "enterprise_value", "roe", "interest_coverage",
@@ -187,6 +259,12 @@ SUPPORTED_METRICS = [
 
 
 _DISPATCH = {
+    "sum":                _sum,
+    "subtract":           _subtract,
+    "multiply":           _multiply,
+    "divide":             _divide,
+    "average":            _average,
+    "percent_change":     _percent_change,
     "cagr":               cagr,
     "free_cash_flow":     free_cash_flow,
     "fcf_yield":          fcf_yield,
@@ -206,6 +284,12 @@ _DISPATCH = {
 # and to tell a caller (e.g. the compute executor / replanner) exactly what
 # a given metric requires without it having to guess from a docstring.
 METRIC_REQUIRED_ARGS = {
+    "sum":                ["values"],
+    "subtract":           ["values"],
+    "multiply":           ["values"],
+    "divide":             ["values"],
+    "average":            ["values"],
+    "percent_change":     ["start_value", "end_value"],
     "cagr":               ["start_value", "end_value", "years"],
     "free_cash_flow":     ["operating_cash_flow", "capex"],
     "fcf_yield":          ["fcf", "market_cap"],
@@ -261,8 +345,15 @@ def _calculate(metric: str, **kwargs) -> str:
     }
 
     try:
-        float_kwargs = {k: _safe(v) for k, v in provided.items()}
-        return f"[Calculator] {_DISPATCH[metric](**float_kwargs)}"
+        # The `values` argument is a LIST (for sum/subtract/multiply/divide/
+        # average) — it must be passed through untouched, NOT coerced with
+        # _safe() which only handles scalars. Each arithmetic function does
+        # its own per-element _safe() internally. All other args are scalars
+        # and get coerced to float here.
+        call_kwargs = {}
+        for k, v in provided.items():
+            call_kwargs[k] = v if k == "values" else _safe(v)
+        return f"[Calculator] {_DISPATCH[metric](**call_kwargs)}"
     except TypeError as exc:
         missing = [a for a in required if a not in provided]
         detail = f" Missing: {', '.join(missing)}." if missing else ""
@@ -273,6 +364,7 @@ def _calculate(metric: str, **kwargs) -> str:
 
 def calculator(
     metric: str,
+    values: list = None,
     start_value: float = None,
     end_value: float = None,
     years: float = None,
@@ -305,9 +397,17 @@ def calculator(
     named, optional parameter (not **kwargs) so the LLM's tool schema shows
     the exact field names for every metric instead of one opaque object.
 
-    metric: one of cagr, free_cash_flow, fcf_yield, altman_z_score,
-            debt_to_equity, current_ratio, gross_margin, revenue_growth,
-            peg_ratio, enterprise_value, roe, interest_coverage.
+    ARITHMETIC (pass a `values` list):
+        sum, subtract, multiply, divide, average — operate on `values`.
+        e.g. calculator(metric="sum", values=[7037663, 7336125, 7418435, 7591949])
+             → "[Calculator] Sum = 29,384,172.00"
+        Use these for ANY plain arithmetic — adding quarters, averaging, etc.
+        percent_change(start_value, end_value) — simple % change, NOT annualized.
+
+    FINANCIAL METRICS:
+        cagr, free_cash_flow, fcf_yield, altman_z_score, debt_to_equity,
+        current_ratio, gross_margin, revenue_growth, peg_ratio,
+        enterprise_value, roe, interest_coverage.
     Only pass the arguments relevant to the chosen metric — see
     METRIC_REQUIRED_ARGS for exactly which ones each metric needs.
 
@@ -321,6 +421,7 @@ def calculator(
     """
     return _calculate(
         metric,
+        values=values,
         start_value=start_value, end_value=end_value, years=years,
         operating_cash_flow=operating_cash_flow, capex=capex, fcf=fcf,
         market_cap=market_cap, working_capital=working_capital,

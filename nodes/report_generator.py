@@ -307,7 +307,7 @@ WRITING STANDARDS:
 #  Node
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _write_section(llm, section_id, section_title, context, ticker, roadmap_summary):
+def _write_section(llm, section_id, section_title, context, ticker, roadmap_summary, user_query=""):
     instruction = SECTION_INSTRUCTIONS.get(
         section_id,
         f"Write the {section_title} section addressing what's relevant to the query, "
@@ -317,6 +317,13 @@ def _write_section(llm, section_id, section_title, context, ticker, roadmap_summ
         SystemMessage(content=REPORT_SYSTEM_PROMPT),
         HumanMessage(content=(
             f"REPORT CONTEXT: {ticker or 'N/A'}\n\n"
+            # The section instructions say things like "address the angle the
+            # user's original query focused on", but the writer was never given
+            # that query — only the ticker, the data and a slice of the outline.
+            # Wording such as a named fiscal year, "in rupees" or "valuation
+            # only" survived only if the earlier planning steps happened to
+            # carry it. It is the user's own words, so it goes in verbatim.
+            f"USER'S ORIGINAL REQUEST (respect its scope and wording):\n{user_query or 'N/A'}\n\n"
             f"SECTION TO WRITE: {section_title} ({section_id})\n\n"
             f"INSTRUCTIONS:\n{instruction}\n\n"
             f"RESEARCH DATA:\n{context}\n\n"
@@ -334,6 +341,7 @@ def report_generator_node(state: AgentState) -> dict:
     outline = state.get("report_outline", {})
     rag_ctx = state.get("rag_context", "")
     report_type = state.get("report_type", "COMPANY_RESEARCH")
+    user_query = (state.get("raw_query") or "")[:600]
 
     # Parse RAG context into per-section dict
     section_contexts: dict[str, str] = {}
@@ -424,7 +432,7 @@ def report_generator_node(state: AgentState) -> dict:
             ctx = rag_ctx[:3000]
         if len(ctx) > 4000:
             ctx = ctx[:4000] + "\n[...context truncated to fit model context window]"
-        section_text = _write_section(llm, sec_id, sec_title, ctx, ticker, roadmap_summary)
+        section_text = _write_section(llm, sec_id, sec_title, ctx, ticker, roadmap_summary, user_query=user_query)
 
         # Append deterministic source tag
         sources = section_source_tools.get(sec_id, set())

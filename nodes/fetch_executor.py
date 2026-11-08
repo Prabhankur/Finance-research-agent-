@@ -19,11 +19,19 @@ Total time ≈ max(group_A_time, group_B_time, group_C_time, group_D_time)
 instead of sum(all_steps).
 """
 from __future__ import annotations
+import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+from langchain_core.messages import HumanMessage, SystemMessage
 from graph.state import AgentState
-from tools import FETCH_TOOL_FUNCTIONS
-from utils.error_classifier import classify_result, is_failure, SYSTEMIC
-from config import LOCAL_RETRY_LIMIT, GLOBAL_REPLAN_BUDGET, COMPUTE_TOOLS
+from tools import FETCH_TOOL_FUNCTIONS, TOOL_DESCRIPTIONS
+from utils.error_classifier import classify_result, is_failure, SYSTEMIC, TRANSIENT, BAD_ARGS
+from utils.groq_client import get_llm, invoke_with_retry
+from utils.helpers import safe_json_parse
+from config import (
+    LOCAL_RETRY_LIMIT, GLOBAL_REPLAN_BUDGET, COMPUTE_TOOLS, TRANSIENT_RETRY_PAUSE_S,
+)
 
 # Which tools share Alpha Vantage's rate limit
 _AV_TOOLS = {"financial_data_api", "earnings_transcript"}
@@ -32,8 +40,58 @@ _WEB_TOOLS = {"web_search"}
 _FRED_TOOLS = {"fred_series"}
 
 
+# An error is worth sending to the model for argument repair only if it reads
+# like an argument problem. An unexpected bug (KeyError in a parser, say) lands
+# in the same BAD_ARGS bucket by default, but no rewording of the arguments
+# fixes it, so spending an LLM call on it would just waste the budget.
+_ARGUMENT_HINT = re.compile(
+    r"argument|parameter|required|invalid|must be|unknown|not a valid|expected|"
+    r"unsupported|positive|missing|unexpected", re.I,
+)
+
+_ARG_FIX_PROMPT = f"""You repair ONE malformed tool call in a financial research
+pipeline. You are given the tool name, the arguments that were sent, and the
+error the tool returned. Reply with ONLY a JSON object holding the corrected
+arguments — the same keys the tool accepts, no commentary, no markdown fences.
+If the error cannot be fixed by changing the arguments, reply with {{}}.
+
+{TOOL_DESCRIPTIONS}"""
+
+
+def _correct_args(tool_name: str, args: dict, error_text: str) -> Optional[dict]:
+    """
+    One model call to repair a bad-arguments failure — the "someone has to
+    reason" branch of the failure policy. Retrying the SAME arguments (what this
+    step used to do) can only reproduce the same error, because the plan fixed
+    them in advance; changing them needs judgement.
+
+    Returns corrected arguments, or None when there is nothing useful to retry
+    (model unavailable, unparseable reply, empty object, or arguments unchanged).
+    """
+    if not _ARGUMENT_HINT.search(error_text or ""):
+        return None
+    try:
+        llm = get_llm(temperature=0.0, max_tokens=300)
+        response = invoke_with_retry(llm, [
+            SystemMessage(content=_ARG_FIX_PROMPT),
+            HumanMessage(content=(
+                f"Tool: {tool_name}\nArguments sent: {args}\nError: {error_text[:600]}"
+            )),
+        ])
+        fixed = safe_json_parse(str(response.content or ""))
+    except Exception:
+        return None
+    if isinstance(fixed, dict) and fixed and fixed != args:
+        return fixed
+    return None
+
+
 def _run_one_fetch_step(step: dict, disabled_tools: set) -> dict:
-    """Executes a single plan step with local retry."""
+    """Executes a single plan step under the failure policy:
+    TRANSIENT -> one retry of the same call after a pause (no model needed);
+    BAD_ARGS  -> one retry with arguments repaired by the model (a same-args
+                 retry cannot succeed); SYSTEMIC -> no retry, the caller
+                 disables the tool and replans; empty -> reported as such."""
     tool_name = step.get("tool")
     args = dict(step.get("args", {}))
     step_num = step.get("step")
@@ -67,6 +125,18 @@ def _run_one_fetch_step(step: dict, disabled_tools: set) -> dict:
             break
         if not is_failure(category):
             break
+        if attempt >= LOCAL_RETRY_LIMIT:
+            break                               # retry budget spent
+
+        if category == TRANSIENT:
+            # Same call again, but not instantly: an immediate retry meets the
+            # same blip (it used to run with a 0.00s gap).
+            time.sleep(TRANSIENT_RETRY_PAUSE_S)
+        elif category == BAD_ARGS:
+            corrected = _correct_args(tool_name, args, result)
+            if corrected is None:
+                break                           # nothing a retry could change
+            args = corrected
         retries_used = attempt + 1
 
     status = "success" if not is_failure(category) else (

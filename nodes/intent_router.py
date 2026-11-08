@@ -34,9 +34,12 @@ from typing import Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+import config
 from config import (
     INTENT_CHAT,
+    INTENT_CLARIFY,
     INTENT_CONFIRM_REPORT,
+    INTENT_OUT_OF_SCOPE,
     INTENT_REPORT,
     INTENT_SMALLTALK,
     REPORT_TYPE_LABELS,
@@ -157,6 +160,38 @@ def extract_ticker_from_text(text: str) -> Optional[str]:
     if not candidates:
         return None
     return min(candidates, key=lambda pair: pair[0])[1]
+
+
+def extract_tickers_from_text(text: str, limit: int = 8) -> list[str]:
+    """
+    EVERY ticker / known company name in the text, in order of appearance,
+    de-duplicated. extract_ticker_from_text returns only the earliest match, which
+    is right for "what is the current company" but wrong for "compare Apple,
+    Microsoft and Nvidia": the other two vanished from state. Same conservative
+    rules — a wrong ticker is worse than none, so unknown names are simply absent.
+    """
+    found: list[tuple[int, str]] = []
+    for explicit in re.finditer(r"\$([A-Za-z]{1,5}(?:\.[A-Za-z]{1,2})?)\b", text):
+        found.append((explicit.start(), explicit.group(1).upper()))
+
+    lowered = text.lower()
+    for name, ticker in _NAME_TO_TICKER.items():
+        match = re.search(rf"\b{re.escape(name)}\b", lowered)
+        if match:
+            found.append((match.start(), ticker))
+
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9/&.$])([A-Z]{2,5}(?:\.[A-Z]{1,2})?)(?![A-Za-z0-9/])", text
+    ):
+        token = match.group(1).upper()
+        if token not in _TICKER_STOPWORDS:
+            found.append((match.start(), token))
+
+    out: list[str] = []
+    for _, ticker in sorted(found, key=lambda pair: pair[0]):
+        if ticker not in out:
+            out.append(ticker)
+    return out[:limit]
 
 
 # Aliases a user might type to OVERRIDE the classifier's guess while a report
@@ -311,6 +346,56 @@ def _classify_report_type(query: str, ticker: Optional[str]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Question understanding (front door) plumbing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _front_door_history(state: ChatState) -> str:
+    """Earlier turns as plain text for the understanding step (never raises)."""
+    try:
+        from nodes.chat_agent import _plain_history
+        return _plain_history(state.get("messages", []), keep=4, per_msg_chars=300)
+    except Exception:
+        return ""
+
+
+def _intent_from_brief(brief: dict) -> str:
+    """Maps a validated brief onto a routing intent. Order matters: scope first."""
+    if not brief.get("in_scope", True):
+        return INTENT_OUT_OF_SCOPE
+    if brief.get("intent") == "smalltalk":
+        return INTENT_SMALLTALK
+    if brief.get("intent") == "report":
+        return INTENT_REPORT
+    if brief.get("ask"):
+        return INTENT_CLARIFY
+    return INTENT_CHAT
+
+
+def _resolve_active_tickers(brief: Optional[dict], user_input: str, previous: list[str]) -> list[str]:
+    """
+    The companies in focus after this turn.
+
+    With a brief: the subjects it names; else the previous ones ONLY if the message
+    genuinely depends on earlier turns; else none — a new topic must not silently
+    inherit the old company (a question about India's GDP used to arrive tagged
+    with Apple). A turn that is not a real question (out of scope, small talk,
+    a clarification) leaves the focus unchanged.
+    Without a brief (rules only): every ticker in the text, else carry the previous
+    ones, as before.
+    """
+    from nodes.query_understanding import brief_tickers
+    if brief:
+        if not brief.get("in_scope", True) or brief.get("intent") == "smalltalk" or brief.get("ask"):
+            return previous
+        named = brief_tickers(brief)
+        if named:
+            return named[:8]
+        return previous if brief.get("uses_previous_context") else []
+    found = extract_tickers_from_text(user_input)
+    return found if found else previous
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Node
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -327,18 +412,36 @@ def intent_router_node(state: ChatState) -> dict:
     pending_query = state.get("pending_report_query")
     has_pending = bool(pending_query)
 
-    # Ticker is computed BEFORE classification so it can feed both the sticky
-    # conversation context AND the report-type classifier's fallback (see the
-    # bug note on _classify_report_type above).
-    ticker = extract_ticker_from_text(user_input) or state.get("active_ticker")
+    previous = list(state.get("active_tickers") or ([state["active_ticker"]] if state.get("active_ticker") else []))
 
     type_override = _match_report_type_override(user_input) if has_pending else None
 
     intent = _rule_intent(user_input, has_pending, type_override)
     source = "rules"
+
+    # Understanding step. Runs for a real question (rules said CHAT, or were
+    # unsure) — not for greetings, a bare yes/no, or an explicit report request,
+    # which the rules already settled for free. One small call; on ANY failure it
+    # returns None and the rules-only behaviour below applies unchanged.
+    brief = None
+    declined_offer = has_pending and bool(_NEGATIVE.match(user_input.strip()))
+    if intent in (None, INTENT_CHAT) and config.FRONT_DOOR_ENABLED and not declined_offer:
+        from nodes.query_understanding import understand_query
+        brief = understand_query(
+            user_input, _front_door_history(state), previous, state.get("conversation_summary"),
+        )
+        if brief:
+            source = "front_door"
+            intent = _intent_from_brief(brief)
     if intent is None:
         intent = _llm_intent(user_input)
         source = "llm"
+
+    # Companies in focus. Computed after classification because the brief decides
+    # them; also feeds the report-type classifier's fallback (see the bug note on
+    # _classify_report_type above).
+    active = _resolve_active_tickers(brief, user_input, previous)
+    ticker = active[0] if active else None
 
     # Per-turn fields are reset here, at the single entry point of the turn.
     # Doing it here rather than in each node means there is one place to look
@@ -349,6 +452,8 @@ def intent_router_node(state: ChatState) -> dict:
         "intent_source": source,
         "tool_loops": 0,
         "active_ticker": ticker,
+        "active_tickers": active,
+        "brief": brief,
         "report_confirmed": False,
         # Both use the reset_or_append reducer (see graph/chat_state.py):
         # passing None clears them, so each turn starts with a clean slate.
@@ -358,11 +463,13 @@ def intent_router_node(state: ChatState) -> dict:
         "successful_tool_results": None,
         "tool_trace": None,
         "contradictions_detected": None,
+        "synthesis_mode": None,
+        "disabled_tools": None,
         "turn_status": "",
     }
 
     print(
-        f"[IntentRouter] intent={intent} via={source} ticker={ticker} "
+        f"[IntentRouter] intent={intent} via={source} tickers={active or None} "
         f"type_override={type_override}"
     )
 
@@ -411,8 +518,14 @@ def intent_router_node(state: ChatState) -> dict:
         ]
         return update
 
-    # CHAT / SMALLTALK — clear any stale pending offer so a later bare "yes"
-    # can't resurrect a report request from three turns ago.
+    if intent == INTENT_CLARIFY:
+        # The turn ends here with ONE question — the agent is not run. The model
+        # proposed the question; _is_blocking (code) decided it was really needed.
+        # Not scored by the evaluator: turn_status stays empty.
+        update["messages"] = [AIMessage(content=brief["ask"])]
+
+    # CHAT / SMALLTALK / CLARIFY / OUT_OF_SCOPE — clear any stale pending offer so
+    # a later bare "yes" can't resurrect a report request from three turns ago.
     update["pending_report_query"] = None
     update["pending_report_type"] = None
     return update
@@ -428,6 +541,8 @@ def route_after_intent(state: ChatState) -> str:
         return "end"            # confirmation message already emitted
     if intent == INTENT_CONFIRM_REPORT:
         return "handoff"        # emit a "starting" message, API takes over
-    if intent == INTENT_SMALLTALK:
+    if intent == INTENT_CLARIFY:
+        return "end"            # the question for the user is already emitted
+    if intent in (INTENT_SMALLTALK, INTENT_OUT_OF_SCOPE):
         return "smalltalk"      # one cheap LLM call, no tools bound
     return "agent"

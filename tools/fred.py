@@ -51,6 +51,52 @@ _SHORTCUTS = {
 }
 
 
+_META_URL = "https://api.stlouisfed.org/fred/series"
+
+
+def resolve_series_id(series_id: str) -> str:
+    """Shortcut ('gdp') -> real FRED ID ('GDP'), same rule _fred_fetch uses.
+
+    Exposed so the storage layer keys macro_series by the REAL id. Before
+    this, a call made with the shortcut 'gdp' would have registered a second
+    series row 'gdp' next to 'GDP' for the very same data.
+    """
+    code = (series_id or "").strip()          # ' gdp ' must resolve like 'gdp'
+    return _SHORTCUTS.get(code.lower(), code.upper())
+
+
+def _fetch_series_metadata(resolved: str, api_key: str) -> Optional[dict]:
+    """
+    GET /fred/series — the endpoint that carries the title, units, frequency
+    and seasonal-adjustment of a series. /series/observations (the only one
+    this tool used to call) returns dates and values and NOTHING describing
+    them, which is why the agent could not tell a Seasonally Adjusted Annual
+    Rate series from a raw quarterly one.
+
+    Strictly best-effort: any failure returns None and the tool behaves
+    exactly as it did before. Metadata is an enrichment, never a dependency.
+    """
+    try:
+        resp = requests.get(
+            _META_URL,
+            params={"series_id": resolved, "api_key": api_key, "file_type": "json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        seriess = resp.json().get("seriess") or []
+        if not seriess:
+            return None
+        row = seriess[0]
+        return {
+            "title":      row.get("title"),
+            "units":      row.get("units"),
+            "frequency":  row.get("frequency"),
+            "adjustment": row.get("seasonal_adjustment"),
+        }
+    except Exception:
+        return None
+
+
 def _fred_fetch(series_id: str, observation_start: Optional[str] = None,
                 observation_end: Optional[str] = None,
                 limit: int = 60) -> str:
@@ -93,8 +139,19 @@ def _fred_fetch(series_id: str, observation_start: Optional[str] = None,
         return f"[FRED] No observations returned for series '{resolved}'."
 
     # Format as a compact readable table
+    meta = _fetch_series_metadata(resolved, api_key)
     lines = [
         f"[FRED] Series: {resolved}  ({series_id if series_id != resolved else 'raw series ID'})",
+    ]
+    if meta:
+        if meta.get("title"):
+            lines.append(f"Title: {meta['title']}")
+        lines.append(
+            f"Units: {meta.get('units') or 'n/a'} | "
+            f"Frequency: {meta.get('frequency') or 'n/a'} | "
+            f"Adjustment: {meta.get('adjustment') or 'n/a'}"
+        )
+    lines += [
         "=" * 60,
         f"{'Date':<12}  {'Value':>15}",
         "-" * 30,

@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
@@ -42,6 +44,29 @@ def _iso(moment: datetime) -> str:
     return moment.isoformat()
 
 
+def canonical_args(args: dict) -> dict:
+    """
+    The arguments as they should be COMPARED, not as they were typed.
+
+    A hash key is exact, so without this "msft", "MSFT" and " Msft " were three
+    different cache entries for the same request (and a lower-case spelling also
+    created a second company row downstream). A model will happily produce any of
+    them. Only the arguments where case and padding cannot change the meaning are
+    touched: ticker (upper-cased, trimmed) and statement_type / period
+    (lower-cased, trimmed). Everything else is left exactly as given — a filing
+    type such as "10-K", for instance, is not ours to reinterpret.
+    """
+    out = dict(args)
+    for name, value in args.items():
+        if not isinstance(value, str):
+            continue
+        if name == "ticker":
+            out[name] = value.strip().upper()
+        elif name in ("statement_type", "period"):
+            out[name] = value.strip().lower()
+    return out
+
+
 def make_cache_key(tool_name: str, args: dict) -> str:
     """
     Stable key for a (tool, arguments) pair.
@@ -49,9 +74,10 @@ def make_cache_key(tool_name: str, args: dict) -> str:
     Args are sorted before hashing so {"ticker":"MSFT","years":2} and
     {"years":2,"ticker":"MSFT"} — the same call, and something an LLM will
     absolutely produce both ways — hit the same cache entry rather than
-    counting as two distinct calls.
+    counting as two distinct calls. They are also canonicalized first (see
+    canonical_args), so spelling variants of the same request share one entry.
     """
-    normalised = json.dumps(args, sort_keys=True, default=str)
+    normalised = json.dumps(canonical_args(args), sort_keys=True, default=str)
     digest = hashlib.sha256(f"{tool_name}|{normalised}".encode()).hexdigest()[:32]
     return f"{tool_name}:{digest}"
 
@@ -92,6 +118,34 @@ def set_cached(cache_key: str, tool_name: str, payload: str, ttl_class: str) -> 
         )
     except Exception as exc:
         print(f"[Cache] Write failed ({exc}) — continuing without caching.")
+    _maybe_purge()
+
+
+# Expired rows are ignored on read, so purging is not a correctness matter — but
+# without it response_cache only ever grew. Cache WRITES trigger it, at most once
+# per interval: a write is the moment the table is growing, it needs no scheduler
+# or background thread, and one indexed DELETE per hour is negligible.
+_PURGE_INTERVAL_S = 3600
+_last_purge = 0.0
+_purge_lock = threading.Lock()
+
+
+def _maybe_purge() -> None:
+    """Runs purge_expired at most once per _PURGE_INTERVAL_S. Never raises."""
+    global _last_purge
+    try:
+        now = time.time()
+        if now - _last_purge < _PURGE_INTERVAL_S:
+            return
+        with _purge_lock:
+            if now - _last_purge < _PURGE_INTERVAL_S:    # another thread just did it
+                return
+            _last_purge = now
+        removed = purge_expired()
+        if removed:
+            print(f"[Cache] Purged expired cache entries ({removed}).")
+    except Exception as exc:
+        print(f"[Cache] Purge skipped ({exc}).")
 
 
 def cached_call(
@@ -124,21 +178,103 @@ def cached_call(
     """
     key = make_cache_key(tool_name, args)
 
-    # The whole cache path is wrapped, not just the individual read/write
-    # helpers. A test caught this gap: guarding get_cached/set_cached
-    # internally still left make_cache_key and the branching logic here
-    # unguarded, so a failure in those propagated out and would have taken
-    # down a tool call that could have simply gone to the live API. A
-    # caching layer that can break the agent is worse than no caching layer.
+    hit = _probe(key, tool_name, ttl_class)
+    if hit is not None:
+        return hit, True
+    print(f"[Cache] MISS {tool_name} ({ttl_class}) — calling live API")
+
+    # REQUEST COALESCING (single-flight). Without this, two identical requests
+    # that arrive together — e.g. the model asking for the same company twice in
+    # one parallel round, or two browser tabs — both miss before either has
+    # stored its result, and BOTH call the live API (a "cache stampede"). On a
+    # provider capped at 25 calls a day that is a real cost. The first thread
+    # for a key becomes the LEADER and does the fetch; identical requests that
+    # arrive meanwhile wait for its result instead of fetching again.
+    while True:
+        flight, leader = _claim(key)
+        if leader:
+            try:
+                # Double-checked: another leader may have finished between our
+                # first probe and winning leadership.
+                hit = _probe(key, tool_name, ttl_class, announce=False)
+                if hit is not None:
+                    flight.payload = hit
+                    return hit, True
+                payload = _fetch_and_store(
+                    key, tool_name, ttl_class, fetch, normalize, provider, source_type
+                )
+                flight.payload = payload      # shared with waiters, even an error text
+                return payload, False
+            finally:
+                _release(key, flight)         # always — a failed fetch must not strand waiters
+
+        print(f"[Cache] COALESCED {tool_name} — an identical request is already in flight; waiting")
+        finished = flight.done.wait(timeout=_COALESCE_WAIT_S)
+        if finished and flight.payload is not None:
+            return flight.payload, True       # answered by the leader's call: no API call of our own
+        if not finished:
+            # The leader is taking unusually long. Stop waiting rather than hang
+            # this request behind it; fetch independently.
+            print(f"[Cache] Coalesced wait for {tool_name} timed out — fetching independently.")
+            return _fetch_and_store(
+                key, tool_name, ttl_class, fetch, normalize, provider, source_type
+            ), False
+        # The leader raised, so there is no result to share. Loop: become the
+        # leader (or follow whoever beat us to it) and try the fetch ourselves.
+
+
+# ── coalescing machinery ──────────────────────────────────────────────────────
+# Process-local on purpose: it coordinates THREADS (the chat tool node's
+# ThreadPoolExecutor, the report fetch groups, concurrent API requests under a
+# single uvicorn worker). Several worker PROCESSES would each have their own
+# table; coordinating across them needs a shared lock (a database advisory lock
+# or Redis) — the natural next step if the app is scaled out.
+_COALESCE_WAIT_S = 90.0
+_INFLIGHT: dict[str, "_Flight"] = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+class _Flight:
+    """One in-progress fetch that identical requests can wait on."""
+    __slots__ = ("done", "payload")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.payload: Optional[str] = None
+
+
+def _claim(key: str) -> tuple["_Flight", bool]:
+    """(flight, is_leader). The first caller for a key leads; the rest follow."""
+    with _INFLIGHT_LOCK:
+        flight = _INFLIGHT.get(key)
+        if flight is None:
+            flight = _INFLIGHT[key] = _Flight()
+            return flight, True
+        return flight, False
+
+
+def _release(key: str, flight: "_Flight") -> None:
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT.get(key) is flight:
+            del _INFLIGHT[key]
+    flight.done.set()
+
+
+def _probe(key: str, tool_name: str, ttl_class: str, announce: bool = True) -> Optional[str]:
+    """Cache lookup that can never raise. A cache that breaks the agent is worse
+    than no cache, so any failure here just means "go to the live API"."""
     try:
         hit = get_cached(key)
-        if hit is not None:
+        if hit is not None and announce:
             print(f"[Cache] HIT {tool_name} ({ttl_class})")
-            return hit, True
-        print(f"[Cache] MISS {tool_name} ({ttl_class}) — calling live API")
+        return hit
     except Exception as exc:
         print(f"[Cache] Lookup path failed ({exc}) — going straight to the live API.")
+        return None
 
+
+def _fetch_and_store(key, tool_name, ttl_class, fetch, normalize, provider, source_type) -> str:
+    """The live fetch plus the store / provenance / normalize steps."""
     payload = fetch()
 
     # Never cache an error response. Caching a transient failure for 7 days
@@ -147,19 +283,12 @@ def cached_call(
         if payload and not _looks_like_error(payload):
             set_cached(key, tool_name, payload, ttl_class)
 
-            # Structured normalization runs strictly AFTER caching, and its
-            # own failures are swallowed (per normalize's contract). The
-            # tool caller sees the same string either way — normalization
-            # is purely additive: it upgrades response_cache's "seen this
-            # call recently" into typed knowledge-layer rows the DB can
-            # answer real queries against.
-            # Provenance recording only needs `provider` — `normalize` is a
-            # SEPARATE, optional upgrade on top of it. This distinction
-            # matters for unstructured content (news, transcripts): there's
-            # no meaningful typed row to extract from a news snippet or a
-            # call transcript, but "which provider, retrieved when" is still
-            # real, useful provenance. Requiring both used to mean
-            # unstructured tools got NO provenance at all, silently.
+            # Structured normalization runs strictly AFTER caching, and its own
+            # failures are swallowed (per normalize's contract). The tool caller
+            # sees the same string either way — normalization is purely additive.
+            # Provenance only needs `provider`; `normalize` is a separate,
+            # optional upgrade (news / transcripts have no typed rows to
+            # extract but still deserve "which provider, retrieved when").
             if provider is not None:
                 try:
                     source_id = record_source(provider=provider, source_type=source_type or "api")
@@ -170,7 +299,7 @@ def cached_call(
     except Exception as exc:
         print(f"[Cache] Store path failed ({exc}) — result still returned.")
 
-    return payload, False
+    return payload
 
 
 def _looks_like_error(payload: str) -> bool:
@@ -227,9 +356,9 @@ def cache_stats() -> dict[str, Any]:
 
 
 def purge_expired() -> int:
-    """Deletes expired rows. Nothing calls this automatically yet — expired
-    entries are simply ignored on read, so this is a maintenance helper
-    rather than a correctness requirement."""
+    """Deletes expired rows. Called automatically from cache writes, at most once
+    an hour (see _maybe_purge); expired entries are ignored on read either way, so
+    this keeps the table from growing without bound rather than guarding correctness."""
     try:
         return execute("DELETE FROM response_cache WHERE expires_at <= ?", (_iso(_now()),))
     except Exception:

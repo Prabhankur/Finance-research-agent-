@@ -1,19 +1,14 @@
-# ── docker-compose.yml — Autonomous Financial Research Agent ─────────────────
+# docker-compose.yml — Autonomous Financial Research Agent
 #
-# Usage:
-#   1. Copy .env.example to .env and fill in your API keys
-#   2. docker-compose up --build
-#   3. Open http://localhost:8000
+# Usage (SQLite, default):
+#   docker-compose up --build
 #
-# For Postgres instead of SQLite:
+# Usage (Postgres):
 #   docker-compose --profile postgres up --build
-# ---------------------------------------------------------------------------
-
-version: "3.9"
 
 services:
 
-  # ── Main application ───────────────────────────────────────────────────────
+  # ── Main application (SQLite — default, no profile needed) ────────────────
   app:
     build:
       context: .
@@ -22,35 +17,15 @@ services:
     container_name: financial-agent
     ports:
       - "8000:8000"
-
-    # Load secrets from .env file — NEVER hardcode API keys here
     env_file:
       - .env
-
-    # Override specific env vars for docker-compose (can be overridden again
-    # by the .env file)
     environment:
-      # Tells the app to write SQLite to a path inside the mounted volume
-      # so the database persists across container restarts.
-      # If DATABASE_URL is set in .env to postgresql://, this is ignored.
       - PYTHONUNBUFFERED=1
       - LANGCHAIN_TRACING_V2=true
       - LANGCHAIN_PROJECT=financial-agent
-
-    # ── Volumes ──────────────────────────────────────────────────────────────
-    # output/ is mounted as a named volume so:
-    #   - The SQLite database (financial_knowledge.db) survives restarts
-    #   - Generated reports (.docx, .md) are accessible on the host
-    #   - The cache survives restarts (avoids re-fetching API data)
-    #
-    # Why named volume and not bind mount:
-    #   Named volumes are managed by Docker and work identically on all OSes.
-    #   Bind mounts have permission issues on Windows and macOS with Docker Desktop.
     volumes:
       - agent_output:/app/output
       - agent_sec_data:/app/sec_data
-
-    # Health check — wait for /api/health to return before marking as healthy
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
@@ -58,38 +33,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
-
     restart: unless-stopped
 
-    # ── Postgres dependency (only active with --profile postgres) ─────────────
-    profiles: ["default"]
-    depends_on: []
-
-  # ── App with Postgres (optional, activate with --profile postgres) ─────────
-  app-postgres:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: runtime
-    container_name: financial-agent-postgres
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      - PYTHONUNBUFFERED=1
-      - LANGCHAIN_TRACING_V2=true
-      # This overrides DATABASE_URL from .env to point at the postgres service
-      - DATABASE_URL=postgresql://agent:agentpass@postgres:5432/financial_agent
-    volumes:
-      - agent_sec_data:/app/sec_data
-    depends_on:
-      postgres:
-        condition: service_healthy
-    profiles: ["postgres"]
-    restart: unless-stopped
-
-  # ── PostgreSQL (only active with --profile postgres) ──────────────────────
+  # ── PostgreSQL (optional — only with: docker-compose --profile postgres up) 
   postgres:
     image: postgres:16-alpine
     container_name: financial-agent-db
@@ -107,7 +53,6 @@ services:
     profiles: ["postgres"]
     restart: unless-stopped
 
-# ── Named volumes ─────────────────────────────────────────────────────────────
 volumes:
   agent_output:
     driver: local

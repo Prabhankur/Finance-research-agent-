@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from database.schema import SCHEMA_STATEMENTS
+from database.schema import DATA_MIGRATIONS, SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS
 
 _DEFAULT_SQLITE_PATH = Path(__file__).resolve().parent.parent / "output" / "financial_knowledge.db"
 _LOCK = threading.Lock()
@@ -77,6 +77,34 @@ def get_connection() -> Iterator[Any]:
         conn.close()
 
 
+def _column_exists(cursor, table: str, column: str) -> bool:
+    """
+    Asks the catalog whether a column exists. Done as an explicit check
+    rather than "try ALTER and swallow the error" because on Postgres a
+    failed statement aborts the whole transaction, which would silently
+    poison every statement after it in init_db.
+    """
+    if is_postgres():
+        cursor.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = %s AND column_name = %s",
+            (table, column),
+        )
+        return cursor.fetchone() is not None
+    cursor.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cursor.fetchall())
+
+
+def _apply_migrations(cursor) -> int:
+    """Adds any SCHEMA_MIGRATIONS columns missing from existing tables."""
+    added = 0
+    for table, column, sql_type in SCHEMA_MIGRATIONS:
+        if not _column_exists(cursor, table, column):
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            added += 1
+    return added
+
+
 def init_db(force: bool = False) -> None:
     """Creates all tables. Idempotent — every statement is IF NOT EXISTS."""
     global _INITIALISED
@@ -88,6 +116,11 @@ def init_db(force: bool = False) -> None:
                 cursor = conn.cursor()
                 for statement in SCHEMA_STATEMENTS:
                     cursor.execute(_translate(statement))
+                migrated = _apply_migrations(cursor)
+                for fix in DATA_MIGRATIONS:
+                    cursor.execute(_translate(fix))
+                if migrated:
+                    print(f"[DB] Migrated existing schema: added {migrated} column(s).")
             _INITIALISED = True
             backend = "PostgreSQL" if is_postgres() else f"SQLite ({_DEFAULT_SQLITE_PATH.name})"
             print(f"[DB] Knowledge layer ready ({backend}).")

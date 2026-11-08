@@ -72,7 +72,11 @@ SCHEMA_STATEMENTS: list[str] = [
         country     TEXT,
         sector      TEXT,
         industry    TEXT,
+        -- Trading currency (what the share is quoted in).
         currency    TEXT,
+        -- Reporting currency (what the financial statements are in). A
+        -- different fact: an ADR can trade in USD yet report in INR.
+        financial_currency TEXT,
         cik         TEXT,
         employees   INTEGER,
         website     TEXT,
@@ -126,6 +130,11 @@ SCHEMA_STATEMENTS: list[str] = [
         total_liabilities    REAL,
         total_equity         REAL,
         total_debt           REAL,
+        -- SEC's LongTermDebt concept. NOT the same quantity as total_debt
+        -- (yfinance 'Total Debt' also includes short-term debt and leases);
+        -- storing it in total_debt made the contradiction detector compare
+        -- two different measures and report false conflicts.
+        long_term_debt       REAL,
         current_assets       REAL,
         current_liabilities  REAL,
         retained_earnings    REAL,
@@ -149,6 +158,12 @@ SCHEMA_STATEMENTS: list[str] = [
         investing_cash_flow  REAL,
         financing_cash_flow  REAL,
         free_cash_flow       REAL,
+        -- Printed by tools/financial_data.py ("Dividends Paid", "Share
+        -- Buybacks") but previously had NO column, so the normalizer threw
+        -- them away. Stored as the provider reports them: negative =
+        -- cash OUT, same convention as capital_expenditure.
+        dividends_paid       REAL,
+        share_repurchases    REAL,
         currency             TEXT,
         source_id            INTEGER REFERENCES sources(id),
         updated_at           TEXT NOT NULL,
@@ -194,6 +209,19 @@ SCHEMA_STATEMENTS: list[str] = [
         peg               REAL,
         dividend_yield    REAL,
         beta              REAL,
+        -- Remaining fields of yfinance's market-overview response. They were
+        -- returned to the model on every overview call but had nowhere to
+        -- live in the typed layer.
+        price             REAL,
+        week52_high       REAL,
+        week52_low        REAL,
+        ma_50             REAL,
+        ma_200            REAL,
+        profit_margin     REAL,
+        roe               REAL,
+        debt_to_equity    REAL,
+        revenue_ttm       REAL,
+        net_income_ttm    REAL,
         source_id         INTEGER REFERENCES sources(id),
         UNIQUE(company_id, date)
     )
@@ -209,6 +237,11 @@ SCHEMA_STATEMENTS: list[str] = [
         country      TEXT,
         frequency    TEXT,
         unit         TEXT,
+        -- 'Seasonally Adjusted Annual Rate' vs 'Not Seasonally Adjusted'.
+        -- This distinction is exactly what a user hit when asking for GDP
+        -- 'not as an annual rate' — the raw observations alone cannot tell
+        -- two series apart without it.
+        seasonal_adjustment TEXT,
         source       TEXT,
         updated_at   TEXT NOT NULL
     )
@@ -243,6 +276,59 @@ SCHEMA_STATEMENTS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_cache_key ON response_cache(cache_key)",
     "CREATE INDEX IF NOT EXISTS idx_cache_expiry ON response_cache(expires_at)",
+]
+
+
+# ── Migrations for databases created before a column existed ─────────────────
+# `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists,
+# so editing a CREATE statement alone never reaches an existing database file.
+# Each entry is (table, column, sql_type); connection.init_db adds the column
+# only if it is not already there (checked via the catalog, so it is safe to
+# run on every start and portable across SQLite and Postgres).
+SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("cash_flow_statements", "dividends_paid",      "REAL"),
+    ("cash_flow_statements", "share_repurchases",   "REAL"),
+    ("valuation_snapshots",  "price",               "REAL"),
+    ("valuation_snapshots",  "week52_high",         "REAL"),
+    ("valuation_snapshots",  "week52_low",          "REAL"),
+    ("valuation_snapshots",  "ma_50",               "REAL"),
+    ("valuation_snapshots",  "ma_200",              "REAL"),
+    ("valuation_snapshots",  "profit_margin",       "REAL"),
+    ("valuation_snapshots",  "roe",                 "REAL"),
+    ("valuation_snapshots",  "debt_to_equity",      "REAL"),
+    ("valuation_snapshots",  "revenue_ttm",         "REAL"),
+    ("valuation_snapshots",  "net_income_ttm",      "REAL"),
+    ("macro_series",         "seasonal_adjustment", "TEXT"),
+    ("balance_sheets",       "long_term_debt",      "REAL"),
+    ("companies",            "financial_currency",  "TEXT"),
+]
+
+# One-off corrections for rows written before a mapping was fixed. Each must
+# be idempotent (a no-op once applied) because init_db runs on every start.
+DATA_MIGRATIONS: list[str] = [
+    # SEC rows used to put LongTermDebt into total_debt. Relocate it.
+    """UPDATE balance_sheets
+          SET long_term_debt = total_debt, total_debt = NULL
+        WHERE total_debt IS NOT NULL AND long_term_debt IS NULL
+          AND source_id IN (SELECT id FROM sources WHERE provider = 'sec')""",
+    # income_statements: keep only the newest row per (company, period, type, provider).
+    # Databases written before the supersede fix hold one extra copy of every
+    # period per refetch. LEFT JOIN + COALESCE so rows with no source are kept.
+    """DELETE FROM income_statements WHERE id NOT IN (
+           SELECT MAX(t.id) FROM income_statements t LEFT JOIN sources s ON s.id = t.source_id
+            GROUP BY t.company_id, t.period_end, t.period_type, COALESCE(s.provider, ''))""",
+    # balance_sheets: keep only the newest row per (company, period, type, provider).
+    # Databases written before the supersede fix hold one extra copy of every
+    # period per refetch. LEFT JOIN + COALESCE so rows with no source are kept.
+    """DELETE FROM balance_sheets WHERE id NOT IN (
+           SELECT MAX(t.id) FROM balance_sheets t LEFT JOIN sources s ON s.id = t.source_id
+            GROUP BY t.company_id, t.period_end, t.period_type, COALESCE(s.provider, ''))""",
+    # cash_flow_statements: keep only the newest row per (company, period, type, provider).
+    # Databases written before the supersede fix hold one extra copy of every
+    # period per refetch. LEFT JOIN + COALESCE so rows with no source are kept.
+    """DELETE FROM cash_flow_statements WHERE id NOT IN (
+           SELECT MAX(t.id) FROM cash_flow_statements t LEFT JOIN sources s ON s.id = t.source_id
+            GROUP BY t.company_id, t.period_end, t.period_type, COALESCE(s.provider, ''))""",
 ]
 
 

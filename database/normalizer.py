@@ -63,6 +63,8 @@ def upsert_company(ticker: str, overview: dict | None = None) -> Optional[int]:
         "sector": (overview or {}).get("Sector"),
         "industry": (overview or {}).get("Industry"),
         "currency": (overview or {}).get("Currency"),
+        "financial_currency": (overview or {}).get("Reporting Currency"),
+        "exchange": (overview or {}).get("Exchange"),
         "cik": (overview or {}).get("CIK"),
         "website": (overview or {}).get("Website"),
         "country": (overview or {}).get("Country"),
@@ -86,7 +88,8 @@ def upsert_company(ticker: str, overview: dict | None = None) -> Optional[int]:
 
         # Insert. `ticker` is guaranteed present; the rest fill NULLs where
         # the source didn't have that field.
-        all_cols = ["ticker", "name", "sector", "industry", "currency", "cik",
+        all_cols = ["ticker", "name", "sector", "industry", "currency",
+                    "financial_currency", "exchange", "cik",
                     "website", "country", "created_at", "updated_at"]
         values = tuple(fields.get(c) for c in all_cols[:-2]) + (now, now)
         placeholders = ", ".join("?" for _ in all_cols)
@@ -210,6 +213,38 @@ def normalize_av_income(ticker: str, payload: dict, source_id: int | None) -> in
     return written
 
 
+def _drop_superseded(table: str, company_id: int, period_end: str,
+                     period_type: str, source_id: int | None) -> None:
+    """
+    Keep ONE row per provider per period; the newest fetch replaces older ones.
+
+    Why this is needed: record_source() writes a NEW sources row for every
+    retrieval (that is the provenance — "fetched at T"), and the uniqueness
+    constraint on fact tables includes source_id. So the ON CONFLICT upsert only
+    ever fired when the SAME source_id was re-used. Every real refetch (after a
+    TTL expiry) got a new source_id and therefore INSERTED a second row for the
+    same company/period instead of updating it; the table grew by one copy of
+    every period per refetch, and readers saw the same fiscal year repeated.
+
+    Runs after the insert, scoped to the same provider, so a SEC row and a
+    yfinance row for the same period still coexist (that pair is what
+    contradiction detection compares). `table` is always an internal constant.
+    """
+    if not source_id:
+        return
+    try:
+        execute(
+            f"""DELETE FROM {table}
+                 WHERE company_id = ? AND period_end = ? AND period_type = ?
+                   AND source_id != ?
+                   AND source_id IN (SELECT id FROM sources
+                                      WHERE provider = (SELECT provider FROM sources WHERE id = ?))""",
+            (company_id, period_end, period_type, source_id, source_id),
+        )
+    except Exception as exc:
+        print(f"[Normalizer] could not drop superseded {table} rows: {exc}")
+
+
 def _upsert_income(f: dict) -> bool:
     """One row per (company, period_end, period_type, source_id) — the UNIQUE
     constraint from schema.py. Using INSERT OR REPLACE (portable to Postgres
@@ -226,11 +261,17 @@ def _upsert_income(f: dict) -> bool:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(company_id, period_end, period_type, source_id) DO UPDATE SET
                 revenue = excluded.revenue,
+                cost_of_revenue = excluded.cost_of_revenue,
                 gross_profit = excluded.gross_profit,
                 operating_income = excluded.operating_income,
                 net_income = excluded.net_income,
+                eps_basic = excluded.eps_basic,
+                eps_diluted = excluded.eps_diluted,
                 ebitda = excluded.ebitda,
                 rd_expense = excluded.rd_expense,
+                -- currency and the EPS/cost columns were missing here, so a row
+                -- that already existed never had them refreshed or filled in.
+                currency = COALESCE(excluded.currency, income_statements.currency),
                 updated_at = excluded.updated_at
             """,
             (
@@ -242,6 +283,8 @@ def _upsert_income(f: dict) -> bool:
                 f.get("currency"), f.get("source_id"), f["updated_at"],
             ),
         )
+        _drop_superseded("income_statements", f["company_id"], f["period_end"],
+                         f["period_type"], f.get("source_id"))
         return True
     except Exception as exc:
         print(f"[Normalizer] income upsert failed: {exc}")
@@ -429,7 +472,94 @@ _TEXT_TO_COLUMN = {
     "Operating Cash Flow": ("cashflow", "operating_cash_flow"),
     "CapEx":               ("cashflow", "capital_expenditure"),
     "Free Cash Flow":      ("cashflow", "free_cash_flow"),
+    # Printed by the tool on every cash-flow call, previously dropped here
+    # because no column existed for them.
+    "Dividends Paid":      ("cashflow", "dividends_paid"),
+    "Share Buybacks":      ("cashflow", "share_repurchases"),
 }
+
+
+# tools/financial_data.py tags every statement header with the currency its
+# numbers are reported in: "Income Statement (Annual) – TCS.NS [reporting currency: INR]"
+_REPORTING_CCY_RE = re.compile(r"\[reporting currency:\s*([A-Za-z]{3})\]")
+
+
+def _parse_overview_block(text: str) -> dict | None:
+    """
+    Extracts the JSON object that follows '[FinData] Market Overview'.
+
+    raw_decode (rather than slicing to the next blank line) is deliberate:
+    it parses exactly one JSON value starting at the brace and ignores
+    whatever follows, so statement blocks appended after the overview in an
+    statement_type="all" response cannot corrupt it.
+    """
+    marker = text.find("[FinData] Market Overview")
+    if marker == -1:
+        return None
+    brace = text.find("{", marker)
+    if brace == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text, brace)
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+# overview JSON key (as printed by tools/financial_data.py) -> valuation column
+_OVERVIEW_TO_VALUATION = {
+    "Market Cap":           "market_cap",
+    "Trailing P/E":         "pe",
+    "Forward P/E":          "forward_pe",
+    "EV/EBITDA":            "ev_ebitda",
+    "Price/Book":           "price_to_book",
+    "Dividend Yield (%)":   "dividend_yield",
+    "Beta":                 "beta",
+    "Current Price":        "price",
+    "52-Week High":         "week52_high",
+    "52-Week Low":          "week52_low",
+    "50-Day MA":            "ma_50",
+    "200-Day MA":           "ma_200",
+    "Profit Margin (%)":    "profit_margin",
+    "Return on Equity (%)": "roe",
+    "Debt/Equity":          "debt_to_equity",
+    "Revenue (TTM)":        "revenue_ttm",
+    "Net Income (TTM)":     "net_income_ttm",
+}
+
+
+def _upsert_valuation_snapshot(company_id: int, overview: dict, source_id: int | None) -> bool:
+    """
+    One row per (company, calendar day). Valuation multiples are point-in-time
+    facts, so a new day is a new snapshot rather than an overwrite; a second
+    call on the SAME day refreshes that day's row (the price moved).
+    """
+    values = {
+        col: _to_float(overview.get(key))
+        for key, col in _OVERVIEW_TO_VALUATION.items()
+    }
+    if all(v is None for v in values.values()):
+        return False
+
+    cols = list(values.keys())
+    today = _now_iso()[:10]
+    placeholders = ", ".join("?" for _ in range(len(cols) + 3))
+    updates = ", ".join(f"{c} = excluded.{c}" for c in cols)
+    try:
+        execute(
+            f"""
+            INSERT INTO valuation_snapshots
+                (company_id, date, {", ".join(cols)}, source_id)
+            VALUES ({placeholders})
+            ON CONFLICT(company_id, date) DO UPDATE SET
+                {updates}, source_id = excluded.source_id
+            """,
+            (company_id, today, *[values[c] for c in cols], source_id),
+        )
+        return True
+    except Exception as exc:
+        print(f"[Normalizer] valuation_snapshots upsert failed: {exc}")
+        return False
 
 
 def normalize_yfinance_text(ticker: str, text: str, source_id: int | None,
@@ -442,11 +572,25 @@ def normalize_yfinance_text(ticker: str, text: str, source_id: int | None,
     changes, this parser produces no rows (silently), the tool call still
     works, and it gets patched here in one place.
     """
-    company_id = upsert_company(ticker)
+    # The overview block is JSON, not "Label : value" lines, so the line
+    # parser below never saw it. upsert_company already accepted an
+    # `overview` dict using exactly these key names — the call that connects
+    # them was simply never made, which is why companies.name/sector/industry
+    # stayed NULL for every ticker.
+    overview = _parse_overview_block(text)
+    company_id = upsert_company(ticker, overview)
     if not company_id:
         return {"income": 0, "balance": 0, "cashflow": 0}
 
+    # One reporting currency per company, so the first tag found applies to
+    # every statement in this payload. Falls back to the overview's value.
+    ccy_match = _REPORTING_CCY_RE.search(text)
+    reporting_ccy = (ccy_match.group(1).upper() if ccy_match
+                     else ((overview or {}).get("Reporting Currency") or None))
+
     counts = {"income": 0, "balance": 0, "cashflow": 0}
+    if overview:
+        counts["valuation"] = 1 if _upsert_valuation_snapshot(company_id, overview, source_id) else 0
 
     # Walk the text period-by-period. yfinance blocks are shaped:
     #   Period: 2026-06-30
@@ -484,6 +628,7 @@ def normalize_yfinance_text(ticker: str, text: str, source_id: int | None,
             f.update({
                 "company_id": company_id, "fiscal_period": None,
                 "period_end": period_end, "period_type": period_type,
+                "currency": reporting_ccy,
                 "source_id": source_id, "updated_at": now,
             })
             if _upsert_income(f):
@@ -497,8 +642,8 @@ def normalize_yfinance_text(ticker: str, text: str, source_id: int | None,
                     INSERT INTO balance_sheets
                         (company_id, period_end, period_type, cash, total_assets,
                          total_liabilities, total_equity, total_debt,
-                         retained_earnings, source_id, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         retained_earnings, currency, source_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(company_id, period_end, period_type, source_id) DO UPDATE SET
                         cash = excluded.cash,
                         total_assets = excluded.total_assets,
@@ -506,15 +651,17 @@ def normalize_yfinance_text(ticker: str, text: str, source_id: int | None,
                         total_equity = excluded.total_equity,
                         total_debt = excluded.total_debt,
                         retained_earnings = excluded.retained_earnings,
+                        currency = COALESCE(excluded.currency, balance_sheets.currency),
                         updated_at = excluded.updated_at
                     """,
                     (
                         company_id, period_end, period_type,
                         b.get("cash"), b.get("total_assets"), b.get("total_liabilities"),
                         b.get("total_equity"), b.get("total_debt"),
-                        b.get("retained_earnings"), source_id, now,
+                        b.get("retained_earnings"), reporting_ccy, source_id, now,
                     ),
                 )
+                _drop_superseded("balance_sheets", company_id, period_end, period_type, source_id)
                 counts["balance"] += 1
             except Exception as exc:
                 print(f"[Normalizer] yfinance balance upsert failed: {exc}")
@@ -532,16 +679,23 @@ def normalize_yfinance_text(ticker: str, text: str, source_id: int | None,
                     INSERT INTO cash_flow_statements
                         (company_id, period_end, period_type,
                          operating_cash_flow, capital_expenditure, free_cash_flow,
+                         dividends_paid, share_repurchases, currency,
                          source_id, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(company_id, period_end, period_type, source_id) DO UPDATE SET
                         operating_cash_flow = excluded.operating_cash_flow,
                         capital_expenditure = excluded.capital_expenditure,
                         free_cash_flow = excluded.free_cash_flow,
+                        dividends_paid = excluded.dividends_paid,
+                        share_repurchases = excluded.share_repurchases,
+                        currency = COALESCE(excluded.currency, cash_flow_statements.currency),
                         updated_at = excluded.updated_at
                     """,
-                    (company_id, period_end, period_type, ocf, capex, fcf, source_id, now),
+                    (company_id, period_end, period_type, ocf, capex, fcf,
+                     c.get("dividends_paid"), c.get("share_repurchases"),
+                     reporting_ccy, source_id, now),
                 )
+                _drop_superseded("cash_flow_statements", company_id, period_end, period_type, source_id)
                 counts["cashflow"] += 1
             except Exception as exc:
                 print(f"[Normalizer] yfinance cashflow upsert failed: {exc}")
@@ -578,7 +732,7 @@ _SEC_LABEL_MAP: dict[str, tuple[str, str]] = {
     "Operating Income":    ("income", "operating_income"),
     "R&D Expense":         ("income", "rd_expense"),
     "Cash & Equivalents":  ("balance", "cash"),
-    "Long-Term Debt":      ("balance", "total_debt"),
+    "Long-Term Debt":      ("balance", "long_term_debt"),
     "Shareholders Equity": ("balance", "total_equity"),
 }
 
@@ -632,6 +786,7 @@ def normalize_sec_xbrl_text(
             f.update({
                 "company_id": company_id, "fiscal_period": None,
                 "period_end": period_end, "period_type": period_type,
+                "currency": "USD",  # tools/sec_filing.py reads only USD / USD-per-share units
                 "source_id": source_id, "updated_at": now,
             })
             if _upsert_income(f):
@@ -643,21 +798,23 @@ def normalize_sec_xbrl_text(
                 execute(
                     """
                     INSERT INTO balance_sheets
-                        (company_id, period_end, period_type, cash, total_debt,
-                         total_equity, source_id, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (company_id, period_end, period_type, cash, long_term_debt,
+                         total_equity, currency, source_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'USD', ?, ?)
                     ON CONFLICT(company_id, period_end, period_type, source_id) DO UPDATE SET
                         cash = excluded.cash,
-                        total_debt = excluded.total_debt,
+                        long_term_debt = excluded.long_term_debt,
                         total_equity = excluded.total_equity,
+                        currency = excluded.currency,
                         updated_at = excluded.updated_at
                     """,
                     (
                         company_id, period_end, period_type,
-                        b.get("cash"), b.get("total_debt"), b.get("total_equity"),
+                        b.get("cash"), b.get("long_term_debt"), b.get("total_equity"),
                         source_id, now,
                     ),
                 )
+                _drop_superseded("balance_sheets", company_id, period_end, period_type, source_id)
                 counts["balance"] += 1
             except Exception as exc:
                 print(f"[Normalizer] SEC balance upsert failed: {exc}")
@@ -669,9 +826,34 @@ def normalize_sec_xbrl_text(
 #  FRED normalization
 # ─────────────────────────────────────────────────────────────────────────────
 
+_FRED_TITLE_RE = re.compile(r"^Title:\s*(.+?)\s*$", re.MULTILINE)
+_FRED_META_RE = re.compile(
+    r"^Units:\s*(.+?)\s*\|\s*Frequency:\s*(.+?)\s*\|\s*Adjustment:\s*(.+?)\s*$",
+    re.MULTILINE,
+)
+
+
+def _parse_fred_header(text: str) -> dict | None:
+    """Reads the optional descriptive header; 'n/a' placeholders become None."""
+    meta_match = _FRED_META_RE.search(text)
+    if not meta_match:
+        return None
+    clean = lambda v: None if v is None or v.strip().lower() == "n/a" else v.strip()
+    title_match = _FRED_TITLE_RE.search(text)
+    return {
+        "title":      clean(title_match.group(1)) if title_match else None,
+        "units":      clean(meta_match.group(1)),
+        "frequency":  clean(meta_match.group(2)),
+        "adjustment": clean(meta_match.group(3)),
+    }
+
+
 def normalize_fred_series(series_id: str, name: str | None, text: str,
                           source_id: int | None) -> int:
     """Parses tools/fred.py's "Date  Value" table output into macro_observations."""
+    # Descriptive header written by tools/fred.py when FRED's /series endpoint
+    # answered: "Title: ..." and "Units: ... | Frequency: ... | Adjustment: ...".
+    meta = _parse_fred_header(text)
     try:
         series_row = query_one("SELECT id FROM macro_series WHERE series_code = ?", (series_id,))
         if series_row:
@@ -682,17 +864,37 @@ def normalize_fred_series(series_id: str, name: str | None, text: str,
                    VALUES (?, ?, ?, ?)""",
                 (series_id, name, "FRED", _now_iso()),
             )
+        if meta:
+            # Overwrite name only when we have a real title: the placeholder
+            # inserted above is just the series code repeated.
+            execute(
+                """UPDATE macro_series
+                      SET name = COALESCE(?, name), unit = COALESCE(?, unit),
+                          frequency = COALESCE(?, frequency),
+                          seasonal_adjustment = COALESCE(?, seasonal_adjustment),
+                          updated_at = ?
+                    WHERE id = ?""",
+                (meta.get("title"), meta.get("units"), meta.get("frequency"),
+                 meta.get("adjustment"), _now_iso(), series_pk),
+            )
     except Exception as exc:
         print(f"[Normalizer] macro_series upsert failed: {exc}")
         return 0
 
     written = 0
-    row_re = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})\s+([\-\d.]+)\s*$")
+    # BUG FIXED HERE: the old pattern `[\-\d.]+` has no comma in its
+    # character class, but tools/fred.py formats every value with
+    # thousand-separators ("29,929.55"). Every GDP-scale observation
+    # silently failed to match, which is exactly why macro_series had rows
+    # (that insert has no comma problem) while macro_observations stayed
+    # completely empty — confirmed by testing the old regex against real
+    # FRED output before writing this fix.
+    row_re = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})\s+([\-\d,.]+)\s*$")
     for line in text.splitlines():
         match = row_re.match(line)
         if not match:
             continue
-        date, value = match.group(1), _to_float(match.group(2))
+        date, value = match.group(1), _to_float(match.group(2).replace(",", ""))
         if value is None:
             continue
         try:

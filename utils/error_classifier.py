@@ -46,7 +46,8 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
                            r"environment variable is missing|credential", re.I)),
     (SYSTEMIC, re.compile(r"too many requests|rate limit exceeded|rate.limited|"
                            r"http\s*(error\s*)?\b429\b|status\s*code[:\s]*\b429\b", re.I)),
-    (TRANSIENT, re.compile(r"timed? ?out|timeout|connection (reset|error|refused)", re.I)),
+    (TRANSIENT, re.compile(r"timed? ?out|timeout|connection ?(reset|error|refused|aborted)|"
+                            r"max retries exceeded|name resolution|temporarily unavailable", re.I)),
     (TRANSIENT, re.compile(r"http\s*(error\s*)?\b5\d\d\b|status\s*code[:\s]*\b5\d\d\b|"
                             r"server error|internal server error|bad gateway|service unavailable|gateway timeout", re.I)),
     (BAD_ARGS, re.compile(r"missing or wrong argument|missing \d+ required (positional|keyword)|unexpected keyword argument|unknown metric", re.I)),
@@ -67,6 +68,11 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
 # gets the same safety net for free.
 _GENERIC_ERROR_PATTERN = re.compile(r"^\[\w[\w .]*\]\s*error\b|^\[error\]", re.I)
 
+# Longest text still treated as "could be an error message" when it carries no
+# explicit "[Tool] Error" prefix. Genuine error strings are a sentence or two;
+# search results and financial statements are far longer.
+_ERROR_TEXT_MAX_CHARS = 400
+
 
 def classify_result(tool_name: str, result: str) -> str:
     """Returns one of SYSTEMIC / BAD_ARGS / LEGITIMATE_EMPTY / TRANSIENT / OK."""
@@ -76,7 +82,17 @@ def classify_result(tool_name: str, result: str) -> str:
     text = result.strip()
     lower = text.lower()
 
+    # Failure keywords are only trusted on text that LOOKS like an error. These
+    # patterns used to be searched across the whole result, so a perfectly
+    # successful web search about "unauthorized trading" or an outage that "timed
+    # out" was labelled systemic. Harmless while the label was just recorded;
+    # not harmless once SYSTEMIC disables the tool for the rest of the turn.
+    # Real tool errors are short or carry the "[Tool] Error ..." prefix.
+    error_shaped = len(text) <= _ERROR_TEXT_MAX_CHARS or bool(_GENERIC_ERROR_PATTERN.search(text))
+
     for category, pattern in _PATTERNS:
+        if category in (SYSTEMIC, TRANSIENT, BAD_ARGS) and not error_shaped:
+            continue
         if pattern.search(text):
             return category
 

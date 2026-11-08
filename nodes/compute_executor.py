@@ -25,13 +25,17 @@ from __future__ import annotations
 from __future__ import annotations
 import json
 import re
+import time
 from typing import Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 from graph.state import AgentState
 from tools import TOOLS_BY_NAME, TOOL_DESCRIPTIONS
 from utils.groq_client import get_llm, invoke_with_retry
-from utils.error_classifier import classify_result, is_failure, SYSTEMIC
-from config import LOCAL_RETRY_LIMIT, GLOBAL_REPLAN_BUDGET, COMPUTE_TOOLS, COMPUTE_STEP_CAP
+from utils.error_classifier import classify_result, is_failure, SYSTEMIC, TRANSIENT
+from config import (
+    LOCAL_RETRY_LIMIT, GLOBAL_REPLAN_BUDGET, COMPUTE_TOOLS, COMPUTE_STEP_CAP,
+    TRANSIENT_RETRY_PAUSE_S,
+)
 
 COMPUTE_SYSTEM_PROMPT = f"""You compute one financial metric using data already
 gathered this run. You will be told which metric to compute and shown the
@@ -174,6 +178,8 @@ def _run_one_compute_step(step: dict, context_chunks: list[dict]) -> dict:
             category = classify_result(tool_name, result)
             retries_used = attempt + 1
             if attempt < LOCAL_RETRY_LIMIT:
+                if category == TRANSIENT:
+                    time.sleep(TRANSIENT_RETRY_PAUSE_S)   # let the blip clear first
                 messages.append(HumanMessage(
                     content=(
                         f"That request failed: {exc}\n"

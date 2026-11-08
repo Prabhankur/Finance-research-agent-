@@ -299,6 +299,7 @@ async def _chat_event_stream(thread_id: str, message: str):
                     successful_tool_results=values.get("successful_tool_results") or [],
                     contradictions=values.get("contradictions_detected") or [],
                     turn_status=values.get("turn_status") or "",
+                    synthesis_mode=values.get("synthesis_mode") or "normal",
                 )
     except Exception as exc:
         print(f"[API] Post-turn scoring dispatch failed: {exc}")

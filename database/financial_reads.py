@@ -67,6 +67,46 @@ def _fmt_num(value) -> str:
         return str(value)
 
 
+# The provider whose payloads this layer reconstructs. financial_data_api caches
+# and normalizes under "yfinance" (see tools/__init__.py), so only those rows can
+# be turned back into that tool's response. Other providers write to the same
+# tables — SEC rows in particular, whose period_end can differ by a day or two
+# from yfinance's — and mixing them in returned one fiscal year twice.
+_OWN_SOURCE = "source_id IN (SELECT id FROM sources WHERE provider = 'yfinance')"
+
+# Rows fetched per requested period. Old databases can hold several rows for the
+# same period (one per past fetch); over-fetch, then keep one row per period.
+_ROW_HEADROOM = 6
+
+
+def _newest_per_period(rows: list[dict], years: int) -> list[dict]:
+    """
+    One row per period_end (the most recently refreshed), at most `years` of
+    them. `rows` arrives ordered period_end DESC, updated_at DESC, id DESC, so
+    the first row seen for each period is the newest. This is what makes the
+    request "N fiscal YEARS" rather than "N rows": a plain LIMIT counted rows,
+    so two fetches of the same two years looked like four years' worth and the
+    rebuild returned the latest year twice and dropped the other.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for row in rows:
+        if row["period_end"] in seen:
+            continue
+        seen.add(row["period_end"])
+        out.append(row)
+        if len(out) == years:
+            break
+    return out
+
+
+def _ccy_suffix(rows: list[dict]) -> str:
+    """' [reporting currency: INR]' — same tag the live tool prints, so a
+    DB-served response carries the currency exactly like a live one."""
+    ccy = next((r.get("currency") for r in rows if r.get("currency")), None)
+    return f" [reporting currency: {ccy}]" if ccy else ""
+
+
 def try_rebuild_financials(
     ticker: str, statement_type: str, period_type: str, years: int
 ) -> Optional[str]:
@@ -80,7 +120,13 @@ def try_rebuild_financials(
     and rebuilding them adds complexity the report pipeline barely uses.
     Not a limitation of the design, just scoped to what's high-value now.
     """
-    if statement_type not in ("income", "balance", "cashflow", "all"):
+    # "all" is NOT served from here. A live "all" response is five blocks —
+    # overview, income, balance, cash flow, ratios — and the typed tables can
+    # only rebuild three of them. Serving those three as if they were the whole
+    # answer silently dropped the Market Overview and Key Ratios while the
+    # model believed it had everything. A miss (live fetch, or the exact-match
+    # text cache, which holds all five) is the honest outcome.
+    if statement_type not in ("income", "balance", "cashflow"):
         return None
 
     company_id = _get_company_id(ticker)
@@ -91,39 +137,43 @@ def try_rebuild_financials(
 
     if statement_type in ("income", "all"):
         rows = query(
-            """SELECT period_end, revenue, gross_profit, operating_income,
+            f"""SELECT period_end, revenue, gross_profit, operating_income,
                       net_income, eps_basic, ebitda, rd_expense, updated_at, currency
                FROM income_statements
-               WHERE company_id = ? AND period_type = ?
-               ORDER BY period_end DESC LIMIT ?""",
-            (company_id, period_type, years),
+               WHERE company_id = ? AND period_type = ? AND {_OWN_SOURCE}
+               ORDER BY period_end DESC, updated_at DESC, id DESC LIMIT ?""",
+            (company_id, period_type, years * _ROW_HEADROOM),
         )
+        rows = _newest_per_period(rows, years)
         if len(rows) < years or not all(_fresh_enough(r["updated_at"], period_type) for r in rows):
             return None
         sections.append(_render_income(ticker, period_type, rows))
 
     if statement_type in ("balance", "all"):
         rows = query(
-            """SELECT period_end, cash, total_assets, total_liabilities, total_equity,
-                      total_debt, retained_earnings, updated_at
+            f"""SELECT period_end, cash, total_assets, total_liabilities, total_equity,
+                      total_debt, retained_earnings, updated_at, currency
                FROM balance_sheets
-               WHERE company_id = ? AND period_type = ?
-               ORDER BY period_end DESC LIMIT ?""",
-            (company_id, period_type, years),
+               WHERE company_id = ? AND period_type = ? AND {_OWN_SOURCE}
+               ORDER BY period_end DESC, updated_at DESC, id DESC LIMIT ?""",
+            (company_id, period_type, years * _ROW_HEADROOM),
         )
+        rows = _newest_per_period(rows, years)
         if len(rows) < years or not all(_fresh_enough(r["updated_at"], period_type) for r in rows):
             return None
         sections.append(_render_balance(ticker, period_type, rows))
 
     if statement_type in ("cashflow", "all"):
         rows = query(
-            """SELECT period_end, operating_cash_flow, capital_expenditure,
-                      free_cash_flow, updated_at
+            f"""SELECT period_end, operating_cash_flow, capital_expenditure,
+                      free_cash_flow, dividends_paid, share_repurchases,
+                      updated_at, currency
                FROM cash_flow_statements
-               WHERE company_id = ? AND period_type = ?
-               ORDER BY period_end DESC LIMIT ?""",
-            (company_id, period_type, years),
+               WHERE company_id = ? AND period_type = ? AND {_OWN_SOURCE}
+               ORDER BY period_end DESC, updated_at DESC, id DESC LIMIT ?""",
+            (company_id, period_type, years * _ROW_HEADROOM),
         )
+        rows = _newest_per_period(rows, years)
         if len(rows) < years or not all(_fresh_enough(r["updated_at"], period_type) for r in rows):
             return None
         sections.append(_render_cashflow(ticker, period_type, rows))
@@ -140,7 +190,7 @@ def try_rebuild_financials(
 
 def _render_income(ticker: str, period_type: str, rows: list[dict]) -> str:
     label = "Income Statement (Annual)" if period_type == "annual" else "Income Statement (Quarterly)"
-    out = [f"[FinData] {label} – {ticker}"]
+    out = [f"[FinData] {label} – {ticker}{_ccy_suffix(rows)}"]
     for row in rows:
         out.append(f"Period: {row['period_end']}")
         out.append(f"  Total Revenue      : {_fmt_num(row.get('revenue'))}")
@@ -158,7 +208,7 @@ def _render_income(ticker: str, period_type: str, rows: list[dict]) -> str:
 
 def _render_balance(ticker: str, period_type: str, rows: list[dict]) -> str:
     label = "Balance Sheet (Annual)" if period_type == "annual" else "Balance Sheet (Quarterly)"
-    out = [f"[FinData] {label} – {ticker}"]
+    out = [f"[FinData] {label} – {ticker}{_ccy_suffix(rows)}"]
     for row in rows:
         out.append(f"Period: {row['period_end']}")
         out.append(f"  Total Assets       : {_fmt_num(row.get('total_assets'))}")
@@ -173,10 +223,14 @@ def _render_balance(ticker: str, period_type: str, rows: list[dict]) -> str:
 
 def _render_cashflow(ticker: str, period_type: str, rows: list[dict]) -> str:
     label = "Cash Flow (Annual)" if period_type == "annual" else "Cash Flow (Quarterly)"
-    out = [f"[FinData] {label} – {ticker}"]
+    out = [f"[FinData] {label} – {ticker}{_ccy_suffix(rows)}"]
     for row in rows:
         out.append(f"Period: {row['period_end']}")
         out.append(f"  Operating Cash Flow: {_fmt_num(row.get('operating_cash_flow'))}")
         out.append(f"  CapEx              : {_fmt_num(row.get('capital_expenditure'))}")
         out.append(f"  Free Cash Flow     : {_fmt_num(row.get('free_cash_flow'))}")
+        if row.get("dividends_paid") is not None:
+            out.append(f"  Dividends Paid     : {_fmt_num(row.get('dividends_paid'))}")
+        if row.get("share_repurchases") is not None:
+            out.append(f"  Share Buybacks     : {_fmt_num(row.get('share_repurchases'))}")
     return "\n".join(out)

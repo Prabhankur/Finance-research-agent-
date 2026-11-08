@@ -9,6 +9,11 @@ instead of hardcoding its own copy.
 # How many times a single failed tool call is retried with the SAME tool
 # (corrected args / same args again) before we give up on that call alone.
 LOCAL_RETRY_LIMIT = 1
+# Pause before the one automatic retry of a TRANSIENT failure (timeout, dropped
+# connection, 5xx). An immediate retry hits the same blip and usually fails the
+# same way; a short pause lets it clear. Applies to code-driven retries only —
+# it costs wall-clock time on a failure and nothing otherwise.
+TRANSIENT_RETRY_PAUSE_S = 1.5
 
 # How many times, for the ENTIRE run, we're allowed to escalate to the
 # replanner node. This is a global budget shared across the fetch executor
@@ -147,6 +152,12 @@ CHAT_MAX_TOOL_LOOPS = 4
 # real ceiling.
 CHAT_MAX_PARALLEL_TOOL_CALLS = 8
 
+# How many companies ONE financial_data_api call may carry (its `tickers` list).
+# The tool node fans such a call out into one parallel fetch per company, so a
+# multi-company question costs one model round instead of one round per company.
+# Also the cap on companies fetched per round across all batch calls.
+CHAT_MAX_BATCH_TICKERS = 8
+
 # How many prior messages to carry forward per thread. Older turns are dropped
 # (oldest-first) rather than summarised — summarisation is a future upgrade.
 CHAT_HISTORY_MAX_MESSAGES = 24
@@ -189,6 +200,7 @@ CHAT_ENABLED_TOOLS = [
     "earnings_transcript",
     "calculator",
     "fred_series",
+    "fx_rate",
     "render_chart",
 ]
 
@@ -215,8 +227,11 @@ INTENT_CHAT           = "CHAT"            # answer conversationally, tools allow
 INTENT_REPORT         = "REPORT"          # user wants the full document pipeline
 INTENT_CONFIRM_REPORT = "CONFIRM_REPORT"  # user said yes to a pending report offer
 INTENT_SMALLTALK      = "SMALLTALK"       # greeting / meta / capability question
+INTENT_OUT_OF_SCOPE   = "OUT_OF_SCOPE"    # not about finance: short reply + redirect
+INTENT_CLARIFY        = "CLARIFY"         # blocked: ask the user ONE question, no agent run
 
-CHAT_INTENTS = [INTENT_CHAT, INTENT_REPORT, INTENT_CONFIRM_REPORT, INTENT_SMALLTALK]
+CHAT_INTENTS = [INTENT_CHAT, INTENT_REPORT, INTENT_CONFIRM_REPORT, INTENT_SMALLTALK,
+                INTENT_OUT_OF_SCOPE, INTENT_CLARIFY]
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 # The LLM-as-judge evaluator fires a background Groq call after every
@@ -235,3 +250,14 @@ import os as _os
 EVAL_ENABLED = _os.getenv("EVAL_ENABLED", "true").strip().lower() not in (
     "false", "0", "no", "off",
 )
+
+# Question-understanding step ("front door"): before the agent runs, one small
+# structured call reads the question and writes a brief — scope, companies,
+# metrics, period, and (only when truly blocked) one question for the user. The
+# ORIGINAL question is never rewritten; the brief travels beside it. Costs one
+# short call (~0.5-1k tokens, no tool schemas) per substantive turn; set to
+# false to fall back to the rules-only router.
+FRONT_DOOR_ENABLED = _os.getenv("FRONT_DOOR_ENABLED", "true").strip().lower() not in (
+    "false", "0", "no", "off",
+)
+FRONT_DOOR_MAX_TOKENS = 400
